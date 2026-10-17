@@ -212,6 +212,13 @@ class RunManager:
         rec.task.add_done_callback(self._tasks.discard)
         return run_id
 
+    async def prime(self, strategy: Strategy, *, progress: Callable[[float, str], None] | None = None) -> FeatureSnapshot:
+        """预热：为策略建快照并写入 10 分钟复用缓存（不产生运行记录）。"""
+        vr = validate_strategy(strategy)
+        if self._fuyao_missing():
+            raise RunError(NO_FUYAO_KEY_ERROR)
+        return await self._snapshot_for(vr.strategy, frozenset(), progress=progress)
+
     async def wait(self, run_id: str, timeout: float | None = None) -> ScreenResult:
         rec = self.record(run_id)
         await asyncio.wait_for(rec.done.wait(), timeout)

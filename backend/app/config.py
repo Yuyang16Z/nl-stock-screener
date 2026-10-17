@@ -19,8 +19,8 @@ class Settings(BaseSettings):
 
     fuyao_api_key: str | None = None
     fuyao_base_url: str = "https://fuyao.aicubes.cn"
-    fuyao_max_concurrency: int = 6
-    fuyao_rps: float = 8.0
+    fuyao_max_concurrency: int = 10
+    fuyao_rps: float = 25.0  # 实测 20 并发无限流；遇 429/4001 自动退避
     fuyao_timeout_s: float = 20.0
 
     ifind_mcp_token: str | None = None

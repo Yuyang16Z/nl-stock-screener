@@ -1,0 +1,25 @@
+# Render Blueprint：New → Blueprint → 选择本仓库。三个密钥在 Render 控制台填写（sync: false，不进仓库）。
+services:
+  - type: web
+    name: screenlens
+    runtime: docker
+    plan: free
+    region: singapore          # 离扶摇/iFinD（国内）与国内评审最近的 Render 区域
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: FUYAO_API_KEY
+        sync: false
+      - key: IFIND_MCP_TOKEN
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_BASE_URL
+        value: https://api.deepseek.com
+      - key: LLM_MODEL
+        value: deepseek-chat
+      - key: WARM_UNIVERSES
+        value: 000300.SH
+      - key: DEMO_FAULTS_ENABLED
+        value: "true"

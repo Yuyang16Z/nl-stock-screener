@@ -1,0 +1,15 @@
+# Render 免费实例闲置 15 分钟会休眠（内存缓存随之清空，首访需约 1 分钟唤醒 + 数据预热）。
+# 只在北京时间 09:00–22:59（UTC 01–14 点）每 10 分钟访问一次健康检查，覆盖评审常用时段，
+# 其余时间允许休眠——免费实例按工作区共享每月 750 小时，全天保活会挤占同工作区其他免费服务的额度。
+# 在仓库 Settings → Variables 设置 APP_URL（如 https://screenlens.onrender.com）后生效。
+name: keepalive
+on:
+  schedule:
+    - cron: "*/10 1-14 * * *"
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    if: ${{ vars.APP_URL != '' }}
+    steps:
+      - run: curl -fsS -m 90 "${{ vars.APP_URL }}/api/health" -o /dev/null -w "%{http_code} %{time_total}s\n" || true

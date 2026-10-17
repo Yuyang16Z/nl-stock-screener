@@ -1,0 +1,10 @@
+# 单包工作区（pnpm 9 要求 packages 字段）
+packages:
+  - '.'
+
+# esbuild（vite 依赖）的 postinstall 只校验本平台二进制，允许执行
+# pnpm 10 读取 onlyBuiltDependencies；pnpm 11+ 读取 allowBuilds
+onlyBuiltDependencies:
+  - esbuild
+allowBuilds:
+  esbuild: true

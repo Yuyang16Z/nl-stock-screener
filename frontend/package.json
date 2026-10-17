@@ -1,0 +1,36 @@
+{
+  "name": "screenlens-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "description": "ScreenLens 选股解释器 - 前端（Vite + React 18 + TypeScript + Ant Design 5 + ECharts）",
+  "type": "module",
+  "packageManager": "pnpm@9.15.9",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
+    "build": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@ant-design/icons": "5.6.1",
+    "antd": "5.29.3",
+    "dayjs": "1.11.23",
+    "echarts": "5.6.0",
+    "echarts-for-react": "3.0.6",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "react-router-dom": "6.30.6",
+    "zustand": "5.0.15"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@types/react": "18.3.31",
+    "@types/react-dom": "18.3.7",
+    "@vitejs/plugin-react": "5.2.0",
+    "typescript": "5.9.3",
+    "vite": "7.3.7"
+  }
+}

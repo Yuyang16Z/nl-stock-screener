@@ -15,8 +15,9 @@ __pycache__/
 node_modules/
 frontend/dist/
 
-# runtime data / caches (never commit vendor data)
-data/
+# runtime data / caches (never commit vendor data) —— 只忽略运行时数据目录，不要误伤源码包 backend/app/data/
+/data/
+backend/data/
 *.sqlite
 *.sqlite3
 *.db

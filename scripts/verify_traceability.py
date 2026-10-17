@@ -53,11 +53,17 @@ async def refetch_raw(fy: httpx.AsyncClient, src: dict, code: str):
     data = body.get("data") or {}
     if "abilities" in data:
         v = flat_indicators(data).get(field)
-        return (None if v is None else float(v)), None
+        try:
+            return (None if v is None else float(v)), None
+        except (TypeError, ValueError):
+            return None, f"原始值非数值：{v!r}"
     for it in data.get("item") or []:
         if it.get("thscode") in (None, code):
             v = it.get(field)
-            return (None if v is None else float(v)), None
+            try:
+                return (None if v is None else float(v)), None
+            except (TypeError, ValueError):
+                return None, f"原始值非数值：{v!r}"
     return None, "重取结果中找不到该股票"
 
 
@@ -181,6 +187,7 @@ async def main():
         out(f"\n## 2. 证据完整性\n- pass/fail 判定 {len(judged)} 条，缺少证据或来源的 {len(no_ev)} 条 {'✓' if not no_ev else '✗'}")
 
         raw = [(c, e) for c, e in judged if e["evidence"] and not e["evidence"].get("derived")
+               and isinstance(e["evidence"].get("value"), (int, float)) and not isinstance(e["evidence"].get("value"), bool)
                and any(s.get("provider") == "fuyao" and s.get("field") for s in e["evidence"]["sources"])]
         sample = random.sample(raw, min(args.sample, len(raw)))
         ok = mism = err = 0

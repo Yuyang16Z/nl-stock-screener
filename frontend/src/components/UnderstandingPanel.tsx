@@ -2,7 +2,7 @@ import { FolderOpenOutlined, QuestionCircleOutlined, StopOutlined, WarningOutlin
 import { Alert, Card, Radio, Space, Tag, Tooltip, Typography } from 'antd';
 import type { ReactNode } from 'react';
 import { useMetrics, useStore } from '../store';
-import type { ClarificationOption, MetricDef, ParseIntent, ParseResult, Strategy } from '../types';
+import type { ClarificationOption, ComplianceNotice, MetricDef, ParseIntent, ParseResult, Strategy } from '../types';
 import { conditionLabel, describeCondition } from '../utils/format';
 import { conditionsForInterpretation, universeName } from '../utils/strategy';
 import { ConflictList } from './ConflictList';
@@ -21,6 +21,23 @@ const INTENT_LABEL: Record<ParseIntent, string> = {
   prediction_request: '涨跌预测请求',
   out_of_scope: '超出可筛选范围',
 };
+
+/** 合规拦截时按 compliance.category 显示意图：后端把收益承诺也归为 prediction_request，直接用 intent 会标错 */
+const COMPLIANCE_INTENT_LABEL: Partial<Record<ComplianceNotice['category'], string>> = {
+  prediction: '涨跌预测请求',
+  advice: '荐股/买卖建议请求',
+  return_promise: '收益承诺请求',
+};
+
+function intentLabel(r: ParseResult): string {
+  const c = r.compliance;
+  // 只在被合规拦截（block，或 intent 已是预测/荐股类）时用类别；warn 级的弱预测措辞仍按原 intent（如“选股”）显示
+  const byCategory =
+    c && (c.level === 'block' || r.intent === 'prediction_request' || r.intent === 'advice_request')
+      ? COMPLIANCE_INTENT_LABEL[c.category]
+      : undefined;
+  return byCategory ?? INTENT_LABEL[r.intent] ?? r.intent;
+}
 
 type MarkKind = 'interp' | 'unsupported' | 'compliance';
 interface Mark {
@@ -179,7 +196,7 @@ export function UnderstandingPanel() {
       }
       extra={
         <Space size={6} wrap>
-          <Tag>{INTENT_LABEL[r.intent] ?? r.intent}</Tag>
+          <Tag>{intentLabel(r)}</Tag>
           <ParserBadge r={r} />
         </Space>
       }

@@ -222,6 +222,23 @@ class FuyaoError(Exception):
         return self.describe()
 
 
+# 分红送转接口对“近期无除权除息事件”的股票返回 code=3002 + "No adjustment events for thscode=..."：
+# 这是“无事件”的业务结果，不是取数失败（实测万科、中芯国际等长期不分红的公司均如此）
+NO_DIVIDEND_EVENTS_CODE = 3002
+NO_DIVIDEND_EVENTS_MARK = "no adjustment events"
+
+
+def is_no_dividend_events(err: FuyaoError | None) -> bool:
+    """dividends 数据集的 3002 且 message 含 "No adjustment events" → 该股无分红送转事件（演示故障注入不算）。"""
+    return (
+        err is not None
+        and err.code == NO_DIVIDEND_EVENTS_CODE
+        and not err.simulated
+        and err.dataset in (None, "dividends")
+        and NO_DIVIDEND_EVENTS_MARK in (err.message or "").lower()
+    )
+
+
 class FuyaoResponse(BaseModel):
     endpoint: str
     params: dict[str, Any] = {}

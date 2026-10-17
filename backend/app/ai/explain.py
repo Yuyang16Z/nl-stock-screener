@@ -369,9 +369,9 @@ def _summary_facts(result: ScreenResult) -> dict[str, Any]:
             for st in result.condition_stats
         ],
         "datasets": [
-            {"label": ds.label, "status": ds.status, "requested": ds.requested, "succeeded": ds.succeeded, "failed": ds.failed}
+            {"label": ds.label, "status": _DS_STATUS_LABEL.get(ds.status, ds.status), "requested": ds.requested, "succeeded": ds.succeeded, "failed": ds.failed}
             for ds in result.datasets
-            if ds.status != "ok"
+            if ds.status in ("partial", "failed")  # 未请求（skipped）的数据集与本次条件无关，不交给 LLM，避免误读为异常
         ],
     }
     if result.report_period is not None:

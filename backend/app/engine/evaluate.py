@@ -11,7 +11,8 @@
 from __future__ import annotations
 
 import math
-from collections import Counter, defaultdict
+import re
+from collections import defaultdict
 from collections.abc import Callable
 
 import numpy as np
@@ -57,6 +58,12 @@ REASON_SKIPPED = "已被前置条件排除，未取数"
 REASON_NOT_FETCHED = "未获取该指标"
 REASON_NO_REFERENCE = "参考组数据不可用"
 REASON_NO_INDUSTRY = "行业归属未知"
+REASON_INDUSTRY_FAILED = "行业归属数据获取失败"
+
+# data_coverage 计数前去掉逐股/逐次不同的部分，同一错误码与类别合并计数（样例保留一个 request_id）
+_RID_RE = re.compile(r"request_id=[^\s)）,，;；]+")
+_CODE_RE = re.compile(r"(?<![0-9A-Za-z])\d{6}\.(?:SH|SZ|BJ)(?![A-Za-z])", re.IGNORECASE)
+_ATTEMPTS_RE = re.compile(r"（共尝试 \d+ 次）")
 
 # positive_only_for_rank 指标非正值时的说明
 _NONPOS_SHORT = {"pe_ttm": "PE", "pb_mrq": "PB", "ps_ttm": "PS", "pcf_ttm": "PCF"}
@@ -170,6 +177,18 @@ def _build_column(cond: Condition, codes: list[str], snap: FeatureSnapshot) -> C
     return col
 
 
+def _industry_failure(snap: FeatureSnapshot) -> str | None:
+    """行业归属数据集（industry_map）失败 / 部分失败时的原因（含错误样例），否则 None。"""
+    ds = next((d for d in snap.datasets if d.dataset == "industry_map"), None)
+    if ds is None or ds.status not in ("failed", "partial"):
+        return None
+    err = ds.errors[0] if ds.errors else "原因未知"
+    text = f"{REASON_INDUSTRY_FAILED}：{err}"
+    if ds.status == "partial":
+        text += f"（部分失败，成功 {ds.succeeded}/{ds.requested}，该股行业归属未取得）"
+    return text
+
+
 def _judge_rank(col: CondColumn, codes: list[str], snap: FeatureSnapshot, usable: list[int]) -> None:
     """分位判定：平均秩法（ops.pct_rank），参考组见模块说明；判定用 ops.check_op。"""
     cond, mdef = col.cond, col.mdef
@@ -216,6 +235,7 @@ def _judge_rank(col: CondColumn, codes: list[str], snap: FeatureSnapshot, usable
                 return groups.get(ic, []) if ic else None
 
     threshold = float(cond.value)  # type: ignore[arg-type]
+    industry_failure = _industry_failure(snap) if scope == "industry" else None
     for i in usable:
         code = codes[i]
         v = float(col.values[i])  # type: ignore[arg-type]
@@ -229,8 +249,12 @@ def _judge_rank(col: CondColumn, codes: list[str], snap: FeatureSnapshot, usable
             continue
         group = group_of(code)
         if group is None:
-            col.status[i] = NA
-            col.reasons[i] = REASON_NO_INDUSTRY
+            if industry_failure is not None:  # 行业归属接口失败造成的“无行业”是数据缺失，不是不适用
+                col.status[i] = MISSING
+                col.reasons[i] = industry_failure
+            else:
+                col.status[i] = NA
+                col.reasons[i] = REASON_NO_INDUSTRY
             continue
         size = len(group)
         col.group_sizes[i] = size
@@ -354,6 +378,23 @@ def _condition_stats(m: EvalMatrix, compute_stats: bool) -> list[ConditionStat]:
     return out
 
 
+def _reason_key(reason: str) -> str:
+    """分组键：去掉 request_id、股票代码与重试次数（逐股不同），同一错误码与类别归为一组。"""
+    key = _RID_RE.sub("request_id=…", reason)
+    key = _CODE_RE.sub("…", key)
+    return _ATTEMPTS_RE.sub("", key)
+
+
+def _top_reason(reasons: list[str]) -> tuple[str, int, bool]:
+    """最常见的原因组 → (样例原文（保留其中一个 request_id）, 只数, 样例是否含 request_id)。并列时取先出现的组。"""
+    groups: dict[str, list[str]] = {}
+    for r in reasons:
+        groups.setdefault(_reason_key(r), []).append(r)
+    members = max(groups.values(), key=len)  # dict 保序 + max 取首个最大 → 确定性
+    sample = next((r for r in members if _RID_RE.search(r)), members[0])
+    return sample, len(members), bool(_RID_RE.search(sample))
+
+
 def _coverage_conflicts(m: EvalMatrix) -> list[Conflict]:
     out: list[Conflict] = []
     for col in m.columns:
@@ -364,14 +405,14 @@ def _coverage_conflicts(m: EvalMatrix) -> list[Conflict]:
         bad = int(bad_mask.sum())
         if evaluated <= 0 or bad / evaluated <= COVERAGE_WARN_RATIO:
             continue
-        top_reason, top_n = Counter(col.reasons[i] or "原因未知" for i in np.nonzero(bad_mask)[0].tolist()).most_common(1)[0]
+        top_reason, top_n, rid_sample = _top_reason([col.reasons[i] or "原因未知" for i in np.nonzero(bad_mask)[0].tolist()])
         pct = round(100.0 * bad / evaluated)
         effect = "这些股票无法确认是否满足该条件。" if col.cond.hard else "软条件计分时按未满足处理。"
         out.append(Conflict(
             id=f"data_coverage:{col.cond.id}", severity="warning", kind="data_coverage",
             condition_ids=[col.cond.id],
             message=(f"条件「{col.cond.label}」有 {bad}/{evaluated} 只股票数据缺失或不适用（{pct}%），{effect}"
-                     f"主要原因：{top_reason}（{top_n} 只）。"),
+                     f"主要原因：{top_reason}（{top_n} 只{'，request_id 为其中一例' if rid_sample and top_n > 1 else ''}）。"),
             suggestion="可在“数据缺失”分组查看逐股原因；可把缺失策略改为“保留并标记”，或改用覆盖更全的指标/口径。",
             source="rule",
         ))

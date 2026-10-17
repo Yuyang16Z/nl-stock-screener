@@ -3,6 +3,8 @@
 输入为 repository 组装的 RawBundle（逐股、逐数据集的原始响应或错误）。规则：
 - 原始字段 null → missing（“接口返回空值（该期未披露或不适用）”）；字符串无法转数值 → missing；
 - 数据集请求失败 → error（原因含错误码与 request_id）；3001/3002 视为数据缺失（missing），3004 视为不适用；
+  例外：分红送转 3002 "No adjustment events" = 该股无分红事件，近365天现金分红按 0 计（ok）；
+- 该股自身日K最后一根早于市场最近交易日（停牌）→ 估值/快照及其派生指标 stale=True（evaluate 判为 missing）；
 - 金融企业的毛利率、流动比率为 null → not_applicable；market_cap_est 在 ps_ttm≤0 或营收TTM≤0 时 not_applicable；
 - 价格窗口样本 < 0.8×N → missing。缺失 / 失败 / 不适用绝不当作通过。
 """
@@ -21,7 +23,7 @@ import numpy as np
 from ..catalog import INDICATOR_FIELDS as CATALOG_INDICATOR_FIELDS
 from ..catalog import METRICS
 from ..schemas import Evidence, MetricStatus, MetricValue, ReportPeriod, SourceRef, StockFeatures, StockInfo
-from .fuyao import FuyaoError, FuyaoResponse, dataset_label
+from .fuyao import FuyaoError, FuyaoResponse, dataset_label, is_no_dividend_events
 from .periods import date_to_datetime, ms_to_date, ms_to_datetime, parse_date, parse_report, report_label, report_period_end
 
 # ───────────────────────────── 口径常量 ─────────────────────────────
@@ -35,6 +37,8 @@ YI = 1e8  # 元 → 亿元
 FINANCIAL_INDUSTRY_KEYWORDS = ("银行", "证券", "保险", "多元金融")
 FINANCIAL_NAME_KEYWORDS = ("银行", "证券", "保险")  # 行业未知时按证券简称兜底判断
 NULL_REASON = "接口返回空值（该期未披露或不适用）"
+# 财务指标数据集返回 5003 时追加的提示（手动指定未到披露期的报告期时常见，避免被理解成单纯的供应商故障）
+INDICATOR_5003_HINT = "（该期可能尚未披露或数据源暂不可用）"
 
 # 财务指标 index_id 以真实接口为准（成长类带 calculate_ 前缀，净利润同比为归母口径），见 docs/DATA_SOURCES.md §3
 INDICATOR_FIELDS: dict[str, str] = dict(CATALOG_INDICATOR_FIELDS)
@@ -129,6 +133,7 @@ class _In:
     evidence: Evidence
     reason: str | None = None
     label: str = ""
+    stale_note: str | None = None  # 非空 = 数值为停牌前（早于市场最近交易日）的快照，派生指标须传播
 
 
 # ───────────────────────────── 通用工具 ─────────────────────────────
@@ -626,6 +631,10 @@ class _Calc:
     def _direct(self, mid: str, inp: _In, *, scale: float = 1.0) -> MetricValue:
         md = METRICS[mid]
         value = inp.value * scale if inp.status == "ok" and inp.value is not None else None
+        stale_note = inp.stale_note if inp.status == "ok" else None
+        note = METRIC_NOTES.get(mid)
+        if stale_note:
+            note = f"{stale_note}；{note}" if note else stale_note
         ev = Evidence(
             metric=mid,
             value=value,
@@ -636,11 +645,12 @@ class _Calc:
             sources=list(inp.evidence.sources),
             derived=False,
             inputs=[inp.evidence] if scale != 1.0 else [],
-            note=METRIC_NOTES.get(mid),
+            note=note,
         )
         if inp.status != "ok":
             return MetricValue(metric=mid, status=inp.status, evidence=ev, reason=inp.reason)
-        return MetricValue(metric=mid, status="ok", value=value, evidence=ev)
+        # 停牌前数值：status 仍为 ok（值可展示），stale=True 交给 evaluate 判为 missing，reason 即说明
+        return MetricValue(metric=mid, status="ok", value=value, evidence=ev, stale=bool(stale_note), reason=stale_note)
 
     def _derived_bad(
         self, mid: str, status: MetricStatus, reason: str, *, period: str | None, inputs: Sequence[_In], as_of: datetime | None = None, note: str | None = None
@@ -674,8 +684,12 @@ class _Calc:
         sources: Sequence[SourceRef] | None = None,
         extra_inputs: Sequence[Evidence] = (),
         stale: bool = False,
+        stale_note: str | None = None,
     ) -> MetricValue:
         md = METRICS[mid]
+        if stale_note:
+            stale = True
+            note = f"{stale_note}；{note}" if note else stale_note
         ev = Evidence(
             metric=mid,
             value=value,
@@ -689,7 +703,7 @@ class _Calc:
             inputs=[i.evidence for i in inputs] + list(extra_inputs),
             note=note,
         )
-        return MetricValue(metric=mid, status="ok", value=value, evidence=ev, stale=stale)
+        return MetricValue(metric=mid, status="ok", value=value, evidence=ev, stale=stale, reason=stale_note)
 
     # ── 原始输入 ──
 
@@ -715,7 +729,15 @@ class _Calc:
         assert f is not None and f.response is not None
         resp = f.response
         t_api = _resp_time(resp)
-        if self.trade_date is not None:
+        own = self._own_stale()
+        stale_note: str | None = None
+        if own is not None:
+            # 该股自身最后一根日K早于市场最近交易日（停牌）：快照数值停留在停牌前，时点按该股最近交易日标注
+            last, why = own
+            stale_note = f"{why}，{'估值' if ds == 'valuations' else '行情快照'}为停牌前数值"
+            t = datetime.combine(last, datetime.min.time(), tzinfo=t_api.tzinfo).replace(hour=15)
+            period = f"该股最近交易日 {last.isoformat()} 收盘（停牌前数值；快照接口返回时间 {t_api:%Y-%m-%d %H:%M}）"
+        elif self.trade_date is not None:
             # 实测：快照/估值信封 data.timestamp 为服务端就绪时间（周日也显示当前时刻），不是成交时间
             t = datetime.combine(self.trade_date, datetime.min.time(), tzinfo=t_api.tzinfo).replace(hour=15)
             period = f"最近交易日 {self.trade_date.isoformat()} 收盘后快照（接口返回时间 {t_api:%Y-%m-%d %H:%M}）"
@@ -726,7 +748,24 @@ class _Calc:
         if f.row is None:
             ev = _raw_ev(name, None, unit=unit, period=period, as_of=t, sources=[src])
             return _In("missing", None, ev, "批量接口未返回该股票记录", label)
-        return _parse_value(f.row, name, unit=unit, period=period, as_of=t, src=src, label=label)
+        inp = _parse_value(f.row, name, unit=unit, period=period, as_of=t, src=src, label=label)
+        if inp.status == "ok" and stale_note:
+            inp.stale_note = stale_note
+            inp.evidence.note = stale_note
+        return inp
+
+    def _own_stale(self) -> tuple[date, str] | None:
+        """该股自身有效日K最后一根早于市场最近交易日 → (该股最近交易日, 说明)。
+
+        只在本股已取日K时判断（策略不需要日K就不判断）；日K失败或无有效K线时同样不判断。
+        """
+        if "own_stale" not in self._cache:
+            out: tuple[date, str] | None = None
+            last = latest_bar_date(self._fetched("history"))
+            if last is not None and self.trade_date is not None and last < self.trade_date:
+                out = (last, f"该股最近交易日为 {last.isoformat()}，早于市场最近交易日 {self.trade_date.isoformat()}（可能停牌）")
+            self._cache["own_stale"] = out
+        return self._cache["own_stale"]
 
     def _ind_input(self, name: str, *, yoy: bool, label: str) -> _In:
         ds = "indicators_yoy" if yoy else "indicators"
@@ -735,6 +774,10 @@ class _Calc:
         unit = _FIELD_UNIT.get(name, "%")
         bad = self._dataset_bad(ds, name, unit, period, label)
         if bad is not None:
+            f0 = self._fetched(ds)
+            err = f0.error if f0 is not None else None
+            if err is not None and err.code == 5003 and not err.simulated and bad.reason and INDICATOR_5003_HINT not in bad.reason:
+                bad.reason += INDICATOR_5003_HINT
             return bad
         f = self._fetched(ds)
         assert f is not None and f.response is not None
@@ -899,18 +942,31 @@ class _Calc:
         return _In("ok", res.value, ev, None, label)
 
     def _market_cap(self) -> MetricValue:
-        """估算总市值：优先 PE(TTM) × 归母净利润TTM；亏损或缺失时用 PS(TTM) × 营业收入TTM。
+        """估算总市值：优先 PE(TTM) × 归母净利润TTM；两者异号、为零或缺失时用 PS(TTM) × 营业收入TTM。
 
+        PE = 市值 ÷ 归母净利润TTM，亏损股两者同为负，乘积仍为正的市值，PE 法照样成立（实测万科 PS 法偏低约 22%）。
         实测（2026-10-17）：茅台 PE 法 16613.6 亿、iFinD 总市值 1.6614 万亿；PS 法 16317.6 亿（偏低 1.8%）。
+        停牌股的估值为停牌前数值：结果 stale=True，由 evaluate 判为 missing。
         """
         mid = "market_cap_est"
         note = "估算值：数据源暂未提供总市值字段"
         pe = self._row_input("valuations", "pe_ttm", "倍", label="市盈率TTM")
         np_ttm = self._ttm_input("parent_holder_net_profit", "归母净利润TTM", "parent_np_ttm")
-        if pe.status == "ok" and np_ttm.status == "ok" and pe.value is not None and np_ttm.value is not None and pe.value > 0 and np_ttm.value > 0:
+        if (
+            pe.status == "ok"
+            and np_ttm.status == "ok"
+            and pe.value is not None
+            and np_ttm.value is not None
+            and math.isfinite(pe.value)
+            and math.isfinite(np_ttm.value)
+            and pe.value * np_ttm.value > 0  # 同号（亏损股同为负）
+        ):
             v = pe.value * np_ttm.value / YI
-            formula = f"pe_ttm × 归母净利润TTM ÷ 1e8 = {pe.value:g} × {np_ttm.value / YI:.2f}亿元"
-            return self._derived_ok(mid, v, period="估值快照 × 归母净利润TTM", inputs=[pe, np_ttm], formula=formula, as_of=pe.evidence.as_of, note=note)
+            loss = "（亏损股：市盈率与归母净利润TTM 同为负，乘积仍为市值）" if pe.value < 0 else ""
+            formula = f"pe_ttm × 归母净利润TTM ÷ 1e8 = {pe.value:g} × {np_ttm.value / YI:.2f}亿元{loss}"
+            return self._derived_ok(
+                mid, v, period="估值快照 × 归母净利润TTM", inputs=[pe, np_ttm], formula=formula, as_of=pe.evidence.as_of, note=note, stale_note=pe.stale_note
+            )
         ps = self._row_input("valuations", "ps_ttm", "倍", label="市销率TTM")
         ttm = self._revenue_ttm_input()
         period = "估值快照 × 营业收入TTM（PE 不可用，改用市销率法）"
@@ -926,8 +982,8 @@ class _Calc:
             )
             return self._derived_bad(mid, "not_applicable", reason, period=period, inputs=inputs, as_of=ps.evidence.as_of, note=note)
         v = ps.value * ttm.value / YI
-        formula = f"ps_ttm × 营业收入TTM ÷ 1e8 = {ps.value:g} × {ttm.value / YI:.2f}亿元（市盈率非正或归母净利润TTM缺失，改用市销率法）"
-        return self._derived_ok(mid, v, period=period, inputs=inputs, formula=formula, as_of=ps.evidence.as_of, note=note)
+        formula = f"ps_ttm × 营业收入TTM ÷ 1e8 = {ps.value:g} × {ttm.value / YI:.2f}亿元（市盈率与归母净利润TTM异号、为零或缺失，改用市销率法）"
+        return self._derived_ok(mid, v, period=period, inputs=inputs, formula=formula, as_of=ps.evidence.as_of, note=note, stale_note=ps.stale_note)
 
     # ── 分红 ──
 
@@ -935,6 +991,27 @@ class _Calc:
         label = f"近{DIVIDEND_WINDOW_DAYS}天每股现金分红"
         start = self.as_of - timedelta(days=DIVIDEND_WINDOW_DAYS)
         period = f"近{DIVIDEND_WINDOW_DAYS}天（{start.isoformat()} 至 {self.as_of.isoformat()}，按除权除息日）"
+        fd = self._fetched("dividends")
+        if fd is not None and is_no_dividend_events(fd.error):
+            # 扶摇对无除权除息事件的股票返回 3002 "No adjustment events"：明确的“无事件”，按 0 处理（不是取数失败）
+            err = fd.error
+            assert err is not None
+            note = f"数据源无分红事件记录（code={err.code}, request_id={err.request_id or '--'}），按 0 处理"
+            src = err.source(thscode=self.code).model_copy(update={"field": "dividend_per_share"})
+            ev = Evidence(
+                metric="dividend_per_share_ttm",
+                value=0.0,
+                unit="元/股",
+                display=fmt_value(0.0, "元/股"),
+                period=period,
+                as_of=date_to_datetime(self.as_of),
+                sources=[src],
+                derived=True,
+                formula="Σ 近365天 dividend_per_share（税前）",
+                inputs=[],
+                note=note,
+            )
+            return _In("ok", 0.0, ev, None, label)
         bad = self._dataset_bad("dividends", "dividend_per_share", "元/股", period, label)
         if bad is not None:
             return bad
@@ -970,6 +1047,8 @@ class _Calc:
         price = self._row_input("snapshot", "last_price", "元", label="最新价")
         period = div.evidence.period
         note = "估算：以除权除息日统计近365天现金分红，送转不计入"
+        if div.status == "ok" and div.evidence.note and div.evidence.note.startswith("数据源无分红事件记录"):
+            note = f"{note}；{div.evidence.note}"
         bad = _worst([div, price])
         if bad is not None:
             return self._derived_bad(mid, bad[0], bad[1], period=period, inputs=[div, price], as_of=price.evidence.as_of, note=note)
@@ -978,7 +1057,9 @@ class _Calc:
             return self._derived_bad(mid, "missing", "最新价非正，无法计算股息率", period=period, inputs=[div, price], as_of=price.evidence.as_of, note=note)
         v = div.value / price.value * 100.0
         formula = f"Σ 近365天 dividend_per_share ÷ last_price × 100 = {div.value:g} ÷ {price.value:g} × 100"
-        return self._derived_ok(mid, v, period=period, inputs=[div, price], formula=formula, as_of=price.evidence.as_of, note=note)
+        return self._derived_ok(
+            mid, v, period=period, inputs=[div, price], formula=formula, as_of=price.evidence.as_of, note=note, stale_note=price.stale_note
+        )
 
     # ── 价格窗口 ──
 

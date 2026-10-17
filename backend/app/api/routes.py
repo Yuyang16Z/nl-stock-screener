@@ -336,6 +336,20 @@ async def start_backtest(req: BacktestRequest, request: Request) -> dict[str, st
         raise HTTPException(400, "回测起止日期格式应为 yyyy-MM-dd") from e
     if req.end and req.end < req.start:
         raise HTTPException(400, "回测结束日期不能早于开始日期")
+    from datetime import date as _date, timedelta as _td
+
+    from ..data.periods import today_cn
+
+    today = today_cn()
+    earliest = _date(today.year - 4, 1, 1) + _td(days=420)  # 日K取数窗口起点 + 约 250 个交易日预热
+    if req.start > today.isoformat():
+        raise HTTPException(400, f"回测开始日期不能晚于今天（{today.isoformat()}）")
+    if req.start < earliest.isoformat():
+        raise HTTPException(
+            400,
+            f"回测开始日期最早为 {earliest.isoformat()}：日K取数窗口从 {today.year - 4}-01-01 开始，"
+            "价格类条件需要约 250 个交易日预热，更早的区间会因缺数而失真。",
+        )
     return {"backtest_id": _state(request).backtests.start(req)}
 
 

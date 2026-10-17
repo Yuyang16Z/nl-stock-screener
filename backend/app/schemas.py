@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # ───────────────────────────── 基础枚举 ─────────────────────────────
 
@@ -84,6 +84,15 @@ class Universe(BaseModel):
     name: str | None = "沪深300"
     codes: list[str] = Field(default_factory=list)  # custom 时的成分
     query: str | None = None  # 未解析的自然语言股票池描述（如“白酒”），由后端解析
+
+    @model_validator(mode="after")
+    def _drop_index_defaults(self) -> "Universe":
+        """全A/自定义股票池没有指数代码；不让 code/name 的“沪深300”默认值冒充股票池名称。"""
+        if self.kind in ("all_a", "custom"):
+            self.code = None
+            if self.name in (None, "", "沪深300") and ("name" not in self.model_fields_set or self.name == "沪深300"):
+                self.name = None
+        return self
 
 
 class UniverseOption(BaseModel):

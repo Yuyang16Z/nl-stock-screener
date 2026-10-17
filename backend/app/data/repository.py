@@ -42,7 +42,7 @@ from .features import (
     market_trade_date,
     reference_value,
 )
-from .fuyao import BATCH_SIZE, DATASET_TTL, FuyaoClient, FuyaoError, FuyaoResponse
+from .fuyao import BATCH_SIZE, DATASET_TTL, FuyaoClient, FuyaoError, FuyaoResponse, is_no_dividend_events
 from .periods import CN_TZ, history_window, make_report_period, ms_to_datetime, now_cn, parse_date, today_cn
 
 log = logging.getLogger(__name__)
@@ -179,20 +179,30 @@ def skipped_status(dataset: str) -> DatasetStatus:
 def status_from_fetched(
     dataset: str, codes: Iterable[str], fetched: Mapping[str, Fetched], note: str | None = None
 ) -> DatasetStatus:
-    """按股票计数；同一次失败请求（批量）只记一条错误样例，如“600519.SH 等 100 只: code=...”。"""
+    """按股票计数；同一次失败请求（批量）只记一条错误样例，如“600519.SH 等 100 只: code=...”。
+
+    dividends 数据集的 code=3002 "No adjustment events" 表示该股近期无分红送转事件（features 按 0 处理），计为成功。
+    """
     acc = _StatusAcc(dataset, note)
     groups: dict[int, tuple[FuyaoError, list[str]]] = {}
+    no_events = 0
     for code in codes:
         f = fetched.get(code)
         if f is None:
             continue
-        if f.error is not None:
+        if f.error is not None and dataset == "dividends" and is_no_dividend_events(f.error):
+            acc.ok(None)
+            no_events += 1
+        elif f.error is not None:
             groups.setdefault(id(f.error), (f.error, []))[1].append(code)
         else:
             acc.ok(f.response)
     for err, cs in groups.values():
         who = cs[0] if len(cs) == 1 else f"{cs[0]} 等 {len(cs)} 只"
         acc.fail(err, who, n=len(cs))
+    if no_events:
+        extra = f"其中 {no_events} 只数据源无分红事件记录（code=3002，No adjustment events），按无分红（0）处理，计为成功"
+        acc.note = f"{acc.note}；{extra}" if acc.note else extra
     return acc.build()
 
 

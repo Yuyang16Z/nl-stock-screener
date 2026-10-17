@@ -3,7 +3,8 @@ import { Space, Tag, Tooltip, Typography } from 'antd';
 import type { Explanation } from '../types';
 import { SENTENCE_KIND_META } from '../utils/format';
 
-/** 带“事实/推断/不确定/提示”标签的解释句子 + 数字校验徽标 */
+/** 带“事实/推断/不确定/提示”标签的解释句子 + 数字出处徽标。
+ *  后端校验只检查文中数字是否出现在引擎证据里，不核对定性表述，徽标措辞不能超出这个范围。 */
 export function ExplanationView({ exp }: { exp: Explanation }) {
   const verified = exp.verified ?? true;
   const notes = exp.verification_notes ?? [];
@@ -14,15 +15,15 @@ export function ExplanationView({ exp }: { exp: Explanation }) {
           {exp.generator === 'llm' ? 'AI 撰写（基于引擎证据）' : '模板生成（基于引擎证据）'}
         </Tag>
         {verified ? (
-          <Tooltip title="文本中的每个数字都已与引擎证据（数值、阈值、计数）核对">
+          <Tooltip title="校验的是文中数字都出现在引擎证据里，不保证每句定性表述都正确；以下方证据表为准">
             <Tag color="success" icon={<SafetyCertificateOutlined />}>
-              数字已校验
+              数字均可在证据中找到
             </Tag>
           </Tooltip>
         ) : (
-          <Tooltip title="部分数字未能与证据核对，请以表格中的数值为准">
+          <Tooltip title="部分数字未能在引擎证据中找到，请以下方证据表中的数值为准">
             <Tag color="warning" icon={<WarningOutlined />}>
-              数字未通过校验
+              部分数字未在证据中找到
             </Tag>
           </Tooltip>
         )}
@@ -51,8 +52,8 @@ export function ExplanationView({ exp }: { exp: Explanation }) {
                 <span>
                   {s.text}
                   {verified && hasNumber && (
-                    <Tooltip title="该句中的数字已与证据核对">
-                      <SafetyCertificateOutlined className="sentence-verified" aria-label="数字已校验" />
+                    <Tooltip title="该句中的数字均可在引擎证据中找到；不代表该句的比较或结论已核对，以证据表为准">
+                      <SafetyCertificateOutlined className="sentence-verified" aria-label="数字均可在证据中找到" />
                     </Tooltip>
                   )}
                 </span>

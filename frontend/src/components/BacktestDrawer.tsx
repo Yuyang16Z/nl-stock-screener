@@ -19,6 +19,17 @@ interface FormValues {
   benchmark: string;
 }
 
+/** 后端历史日K取数窗口起点：(今年−4)-01-01（与 backend data/periods.history_window 一致，按北京时间取年份） */
+function historyWindowStart(): Dayjs {
+  return dayjs(`${todayCN().year() - 4}-01-01`).startOf('day');
+}
+
+/** 回测开始日最早可选：窗口起点 + 420 个自然日（约 250 个交易日的指标预热） */
+const WARMUP_DAYS = 420;
+function earliestBacktestStart(): Dayjs {
+  return historyWindowStart().add(WARMUP_DAYS, 'day');
+}
+
 type StatKey = keyof PerfStats;
 const STAT_ROWS: { key: StatKey; label: string; kind: 'ret' | 'pct' | 'num' | 'cnt'; strategyOnly?: boolean; tip?: string }[] = [
   { key: 'total_return', label: '累计收益', kind: 'ret' },
@@ -126,6 +137,9 @@ export function BacktestDrawer({
   }, [catalog]);
 
   const notBacktestable = (strategy?.conditions ?? []).filter((c) => (c.enabled ?? true) && metrics[c.metric] && !metrics[c.metric].backtestable);
+  const windowStart = historyWindowStart();
+  const minStart = earliestBacktestStart();
+  const defaultStart = todayCN().subtract(3, 'year');
 
   const start = async () => {
     if (!strategy) return;
@@ -212,6 +226,13 @@ export function BacktestDrawer({
 
   const status = bt ? JOB_STATUS_META[bt.status] : null;
   const ignored = bt?.ignored_conditions ?? [];
+  // 实际回测区间以后端净值曲线为准（开始日早于取数窗口时后端会截断，请求区间不等于实际区间）
+  const curvePts = bt?.curve ?? [];
+  const actualStart = curvePts.length ? curvePts[0].date : null;
+  const actualEnd = curvePts.length && bt?.status === 'done' ? curvePts[curvePts.length - 1].date : null;
+  const requestedRange = bt ? `${bt.request.start} ~ ${bt.request.end ?? '今天'}` : '';
+  const actualRange = bt && actualStart ? `${actualStart} ~ ${actualEnd ?? bt.request.end ?? '今天'}` : null;
+  const startLagDays = bt && actualStart ? dayjs(actualStart).diff(dayjs(bt.request.start), 'day') : 0;
 
   return (
     <Drawer
@@ -219,8 +240,15 @@ export function BacktestDrawer({
       onClose={onClose}
       width={900}
       title={
-        <Space>
-          <LineChartOutlined /> 历史回测
+        <Space size={8} wrap>
+          <span>
+            <LineChartOutlined /> 历史回测
+          </span>
+          {actualRange && (
+            <Typography.Text type="secondary" style={{ fontSize: 13, fontWeight: 'normal' }}>
+              实际区间 {actualRange}
+            </Typography.Text>
+          )}
         </Space>
       }
     >
@@ -239,7 +267,7 @@ export function BacktestDrawer({
           form={form}
           layout="inline"
           initialValues={{
-            range: [todayCN().subtract(3, 'year'), todayCN()],
+            range: [defaultStart.isBefore(minStart, 'day') ? minStart : defaultStart, todayCN()],
             rebalance: 'monthly',
             top_n: 20,
             cost_bps: 10,
@@ -247,8 +275,23 @@ export function BacktestDrawer({
           }}
           style={{ rowGap: 8 }}
         >
-          <Form.Item name="range" label="区间" rules={[{ required: true, message: '请选择区间' }]}>
-            <DatePicker.RangePicker allowClear={false} disabledDate={(d) => d.isAfter(dayjs())} />
+          <Form.Item
+            name="range"
+            label="区间"
+            rules={[
+              { required: true, message: '请选择区间' },
+              {
+                validator: (_, v?: [Dayjs, Dayjs]) =>
+                  v?.[0] && v[0].isBefore(minStart, 'day')
+                    ? Promise.reject(new Error(`开始日期最早为 ${minStart.format('YYYY-MM-DD')}`))
+                    : Promise.resolve(),
+              },
+            ]}
+          >
+            <DatePicker.RangePicker
+              allowClear={false}
+              disabledDate={(d) => d.isAfter(dayjs()) || d.isBefore(minStart, 'day')}
+            />
           </Form.Item>
           <Form.Item name="rebalance" label="调仓">
             <Select
@@ -277,6 +320,10 @@ export function BacktestDrawer({
             </Space>
           </Form.Item>
         </Form>
+        <div className="chart-note" style={{ marginTop: 6 }}>
+          开始日期最早可选 {minStart.format('YYYY-MM-DD')}：需要约 250 个交易日的预热窗口（历史行情自{' '}
+          {windowStart.format('YYYY-MM-DD')} 起取数，更早的开始日会因缺数被截断）。
+        </div>
 
         {notBacktestable.length > 0 && !bt && (
           <Alert
@@ -310,12 +357,17 @@ export function BacktestDrawer({
 
         {bt && (bt.status === 'done' || (bt.curve ?? []).length > 0) && (
           <>
-            <Space size={8}>
+            <Space size={8} wrap>
               {status && <Tag color={status.color}>{status.label}</Tag>}
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                {bt.request.start} ~ {bt.request.end ?? '今天'} · {bt.request.rebalance === 'quarterly' ? '每季' : '每月'}调仓 · 持仓上限{' '}
-                {bt.request.top_n ?? '不限'} · 单边成本 {bt.request.cost_bps ?? 10} bps · 基准 {bt.request.benchmark}
+                {actualRange ? `实际区间 ${actualRange}` : requestedRange}
+                {actualRange && actualRange !== requestedRange ? `（所选 ${requestedRange}）` : ''} ·{' '}
+                {bt.request.rebalance === 'quarterly' ? '每季' : '每月'}调仓 · 持仓上限 {bt.request.top_n ?? '不限'} · 单边成本{' '}
+                {bt.request.cost_bps ?? 10} bps · 基准 {bt.request.benchmark}
               </Typography.Text>
+              {startLagDays > 7 && (
+                <Tag color="orange">实际起始日比所选开始日晚 {startLagDays} 天，详见“回测假设”</Tag>
+              )}
             </Space>
             <div>
               <div className="section-title">净值曲线（策略 vs 基准）</div>

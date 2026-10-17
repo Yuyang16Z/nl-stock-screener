@@ -50,7 +50,7 @@ MAX_RUNS = 50
 SNAPSHOT_TTL_S = 600.0
 SUMMARY_LLM_TIMEOUT_S = 20.0
 STOCK_LLM_TIMEOUT_S = 30.0
-PRICE_POINTS = 250
+PRICE_POINTS = 251  # 250 日窗口 + 区间起点前一日（与 features._window(with_base=True) 一致，回撤前高可在图上复核）
 CHEAP_METRICS: frozenset[str] = frozenset(m for m, d in METRICS.items() if set(d.datasets) <= CHEAP_DATASETS)
 RANK_REF_SCOPES = ("industry", "market")
 
@@ -317,7 +317,7 @@ class RunManager:
         prog(0.0, "解析股票池")
         universe = await self.repo.resolve_universe(strategy.universe, faults=faults)
         if universe.size == 0 or not universe.members:
-            raise RunError(f"股票池“{universe.name}”没有可用成分股，请换一个股票池")
+            raise RunError(f"股票池“{universe.name}”没有可用成分股，请换一个股票池" + (f"（{universe.note}）" if universe.note else ""))
         prog(0.02, f"股票池：{universe.name}（{universe.size} 只）")
         wanted = _enabled_metrics(strategy) | set(DISPLAY_METRICS)
 
@@ -411,12 +411,18 @@ class RunManager:
         for ds in snap.datasets:
             if ds.status not in ("partial", "failed"):
                 continue
-            affected = [c.label or c.metric for c in enabled if ds.dataset in METRICS[c.metric].datasets]
+            affected = [
+                c.label or c.metric
+                for c in enabled
+                if ds.dataset in METRICS[c.metric].datasets or (ds.dataset == "industry_map" and c.rank_scope == "industry")
+            ]
             if ds.dataset in ("tickers", "industry_map"):
                 affected = affected or ["（股票名称/行业归属）"]
             what = "部分失败" if ds.status == "partial" else "失败"
             stat = f"（成功 {ds.succeeded}/{ds.requested}）" if ds.requested else ""
             out.append(f"{ds.label} 数据{what}{stat}，受影响条件：{'、'.join(affected) if affected else '无（仅影响展示指标）'}；相关股票按数据缺失处理")
+        if snap.universe.kind == "custom" and snap.universe.note:
+            out.append(f"自定义股票池：{snap.universe.note}")
         if snap.prefiltered:
             out.append("全A模式：先用估值/行情等廉价条件预筛，未通过预筛的股票不再深度取数（显示为“已被前置条件排除，未取数”）。")
         return out
@@ -502,13 +508,15 @@ class RunManager:
             raise RunError("该运行尚未完成或已失败，暂无个股数据")
         return rec
 
-    async def _prices(self, thscode: str) -> tuple[list[PricePoint], SourceRef | None, str | None]:
+    async def _prices(self, thscode: str, faults: frozenset[str] = frozenset()) -> tuple[list[PricePoint], SourceRef | None, str | None]:
+        if "history" in faults:
+            return [], None, "本次运行为故障演示：历史日K接口被模拟为不可用，走势图不展示（与筛选判定保持一致）"
         try:
             start, end = history_window(today_cn())
             resp = await self.repo.history(thscode, start, end, "backward")
             bars = bars_from_response(resp)[-PRICE_POINTS:]
             pts = [PricePoint(date=b.day.isoformat(), close=float(b.close)) for b in bars if b.close is not None]
-            note = f"后复权收盘价（最近 {len(pts)} 个交易日，已剔除停牌日）" if pts else "接口未返回有效日K数据"
+            note = f"后复权收盘价（最近 {len(pts)} 个交易日，含区间起点前一日收盘，便于复核回撤与收益；已剔除停牌日）" if pts else "接口未返回有效日K数据"
             return pts, resp.source("close_price", thscode=thscode), note
         except FuyaoError as e:
             return [], e.source(thscode=thscode) if hasattr(e, "source") else None, f"价格走势获取失败：{fuyao_error_text(e)}"
@@ -529,7 +537,7 @@ class RunManager:
         if st is None:
             raise NotFoundError(f"股票 {code} 不在本次运行的股票池中")
         sr = self._find_stock(rec, code)
-        prices, src, note = await self._prices(code)
+        prices, src, note = await self._prices(code, rec.faults)
         return StockDetail(
             info=st.info, bucket=sr.bucket if sr else None, metrics=dict(st.metrics),
             evaluations=list(sr.evaluations) if sr else [], prices=prices, price_source=src, price_note=note,
@@ -581,7 +589,7 @@ class RunManager:
                 raw.append(float(v) if mv.status == "ok" and isinstance(v, (int, float)) and not isinstance(v, bool) else None)
             rows.append(CompareRow(metric=m, label=mdef.name, unit=mdef.unit, period=period, values=values, raw=raw))
 
-        fetched = await asyncio.gather(*(self._prices(c) for c in codes))
+        fetched = await asyncio.gather(*(self._prices(c, rec.faults) for c in codes))
         notes = ["指标取自本次运行的数据快照（与筛选同一时点）；走势为后复权收盘价，按共同区间首日归一为 100。"]
         series: dict[str, list[PricePoint]] = {}
         for code, (pts, _src, note) in zip(codes, fetched):

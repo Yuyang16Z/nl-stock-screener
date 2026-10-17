@@ -5,6 +5,7 @@ import {
   PlayCircleOutlined,
   ReloadOutlined,
   UploadOutlined,
+  WarningOutlined,
 } from '@ant-design/icons';
 import { Alert, App, Button, Card, Empty, Popconfirm, Popover, Space, Table, Tabs, Tag, Tooltip, Typography, Upload } from 'antd';
 import type { TableColumnsType } from 'antd';
@@ -255,11 +256,61 @@ function newestRun(runs: MonitorRun[]): MonitorRun | undefined {
   return [...runs].sort((a, b) => (b.run_at ?? '').localeCompare(a.run_at ?? ''))[0];
 }
 
-function DiffCell({ diff }: { diff: ResultDiff | null | undefined }) {
+const UNRELIABLE_DIFF_TEXT = '本次数据不完整，变化未必可靠';
+
+/** 数据不完整时的对比说明：后端给出的 changes_text + 本次 data_alerts */
+function UnreliableDiffNotes({ diff, alerts }: { diff: ResultDiff | null | undefined; alerts: string[] }) {
+  const changes = diff?.changes_text ?? [];
+  return (
+    <div style={{ maxWidth: 480, fontSize: 12.5 }}>
+      {changes.length > 0 && (
+        <ul className="alert-list" style={{ marginBottom: 6 }}>
+          {changes.map((t, i) => (
+            <li key={i}>{t}</li>
+          ))}
+        </ul>
+      )}
+      {alerts.length > 0 && (
+        <>
+          <div className="muted">数据告警：</div>
+          <ul className="alert-list" style={{ marginBottom: 0 }}>
+            {alerts.map((a, i) => (
+              <li key={i} className="text-error">
+                {a}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </div>
+  );
+}
+
+function DiffCell({ diff, alerts = [] }: { diff: ResultDiff | null | undefined; alerts?: string[] }) {
   if (!diff) return <span className="muted">首次运行（无对比）</span>;
   const added = diff.added ?? [];
   const removed = diff.removed ?? [];
+  const unreliable = alerts.length > 0;
   if (!added.length && !removed.length) {
+    if (unreliable) {
+      // 数据集部分失败/失败时，“没有新增/移除”不代表名单真的没变：不写“无变化”，改为警示并给出原因
+      return (
+        <div>
+          <Popover title="与上次运行相比" content={<UnreliableDiffNotes diff={diff} alerts={alerts} />}>
+            <Tag color="warning" icon={<WarningOutlined />} style={{ cursor: 'help', marginInlineEnd: 0 }}>
+              {UNRELIABLE_DIFF_TEXT}
+            </Tag>
+          </Popover>
+          {(diff.changes_text ?? []).length > 0 && (
+            <ul className="alert-list muted" style={{ fontSize: 12, margin: '4px 0 0' }}>
+              {(diff.changes_text ?? []).map((t, i) => (
+                <li key={i}>{t}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      );
+    }
     return <span className="muted">入选名单无变化（不变 {diff.unchanged ?? 0} 只）</span>;
   }
   return (
@@ -267,12 +318,23 @@ function DiffCell({ diff }: { diff: ResultDiff | null | undefined }) {
       title="与上次运行相比"
       content={
         <div style={{ maxWidth: 480, maxHeight: 360, overflow: 'auto', fontSize: 12.5 }}>
-          {(diff.changes_text ?? []).length > 0 && (
-            <ul className="alert-list" style={{ marginBottom: 6 }}>
-              {(diff.changes_text ?? []).map((t, i) => (
-                <li key={i}>{t}</li>
-              ))}
-            </ul>
+          {unreliable && (
+            <div className="text-error" style={{ marginBottom: 4 }}>
+              <WarningOutlined /> {UNRELIABLE_DIFF_TEXT}
+            </div>
+          )}
+          {unreliable ? (
+            <div style={{ marginBottom: 6 }}>
+              <UnreliableDiffNotes diff={diff} alerts={alerts} />
+            </div>
+          ) : (
+            (diff.changes_text ?? []).length > 0 && (
+              <ul className="alert-list" style={{ marginBottom: 6 }}>
+                {(diff.changes_text ?? []).map((t, i) => (
+                  <li key={i}>{t}</li>
+                ))}
+              </ul>
+            )
           )}
           {added.map((it) => (
             <div className="diff-item" key={`a-${it.thscode}`}>
@@ -295,7 +357,12 @@ function DiffCell({ diff }: { diff: ResultDiff | null | undefined }) {
         </div>
       }
     >
-      <Space size={4} style={{ cursor: 'help' }}>
+      <Space size={4} wrap style={{ cursor: 'help' }}>
+        {unreliable && (
+          <Tag color="warning" icon={<WarningOutlined />}>
+            {UNRELIABLE_DIFF_TEXT}
+          </Tag>
+        )}
         <Tag color="blue">新增 {added.length}</Tag>
         <Tag>移除 {removed.length}</Tag>
         <span className="muted" style={{ fontSize: 12 }}>
@@ -338,7 +405,7 @@ function RunsTable({ runs }: { runs: MonitorRun[] }) {
       render: (_, r) => <span className="num">{r.included_count ?? '--'}</span>,
     },
     { title: '交易日', key: 'td', width: 110, render: (_, r) => r.trade_date ?? '--' },
-    { title: '新增 / 移除', key: 'diff', render: (_, r) => <DiffCell diff={r.diff} /> },
+    { title: '新增 / 移除', key: 'diff', render: (_, r) => <DiffCell diff={r.diff} alerts={r.data_alerts ?? []} /> },
     {
       title: '数据告警',
       key: 'alerts',
@@ -505,19 +572,28 @@ function MonitorsTab() {
     {
       title: '最近一次',
       key: 'latest',
-      width: 220,
+      width: 250,
       render: (_, m) => {
         const r = newestRun(m.runs ?? []);
         if (!r) return <span className="muted">尚未运行</span>;
-        const alerts = (r.data_alerts ?? []).length;
+        const runAlerts = r.data_alerts ?? [];
+        const alerts = runAlerts.length;
         return (
           <Space size={4} wrap>
             <Tag color={JOB_STATUS_META[r.status]?.color}>{JOB_STATUS_META[r.status]?.label}</Tag>
             <span className="num">入选 {r.included_count ?? '--'}</span>
-            {r.diff && (
+            {/* 有数据告警时不显示 “+0 / −0” 这类会被读成“无变化”的对比数 */}
+            {r.diff && alerts === 0 && (
               <span className="muted" style={{ fontSize: 12 }}>
                 +{r.diff.added?.length ?? 0} / −{r.diff.removed?.length ?? 0}
               </span>
+            )}
+            {alerts > 0 && (
+              <Popover title="最近一次运行" content={<UnreliableDiffNotes diff={r.diff} alerts={runAlerts} />}>
+                <Tag color="warning" icon={<WarningOutlined />} style={{ cursor: 'help' }}>
+                  {UNRELIABLE_DIFF_TEXT}
+                </Tag>
+              </Popover>
             )}
             {alerts > 0 && <Tag color="error">数据告警 {alerts}</Tag>}
           </Space>
@@ -597,7 +673,7 @@ function MonitorsTab() {
         columns={columns}
         dataSource={list}
         pagination={list.length > 20 ? { pageSize: 20 } : false}
-        scroll={{ x: 1180 }}
+        scroll={{ x: 1210 }}
         expandable={{
           expandedRowRender: (m) => <RunsTable runs={m.runs ?? []} />,
           rowExpandable: () => true,

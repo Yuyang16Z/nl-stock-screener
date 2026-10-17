@@ -378,6 +378,8 @@ def detect_conflicts(strategy: Strategy) -> list[Conflict]:
 
     _check_tension(s, valid, out)
     _check_weights(valid, out)
+    _check_negative_values(valid, out)
+    _check_report_period(s, out)
 
     if not any(c.hard for c in active):
         out.add(
@@ -387,6 +389,56 @@ def detect_conflicts(strategy: Strategy) -> list[Conflict]:
         )
 
     return sorted(out.items, key=lambda x: _SEVERITY_ORDER[x.severity])
+
+
+def _lower_bound_positive(c: Condition) -> bool:
+    """该条件是否保证数值 > 0（或 ≥ 0），从而排除负值。"""
+    if c.op in ("gt", "gte") and c.value is not None:
+        return c.value >= 0
+    if c.op == "between" and c.value is not None and c.value2 is not None:
+        return min(c.value, c.value2) >= 0
+    return False
+
+
+def _check_negative_values(valid: Sequence[Condition], out: _Collector) -> None:
+    """估值倍数为负（亏损、净资产或现金流为负）时，“PE < 30”这类上限条件也会成立。"""
+    by_metric: dict[str, list[Condition]] = {}
+    for c in valid:
+        md = catalog.METRICS.get(c.metric)
+        if md is not None and md.positive_only_for_rank and c.op in ("lt", "lte"):
+            by_metric.setdefault(c.metric, []).append(c)
+    for metric, caps in by_metric.items():
+        guarded = any(_lower_bound_positive(c) for c in valid if c.metric == metric)
+        if guarded:
+            continue
+        name = catalog.METRICS[metric].name
+        out.add(
+            "warning", "implausible", caps,
+            f"{_qs(caps)}对{name}为负的公司（如亏损公司）同样成立：负值会被判为“通过”。",
+            f"如需排除亏损/负值，补充条件「{name} > 0」，或改为“介于 0 ~ 上限”。",
+            tag=f"negative_{metric}",
+        )
+
+
+def _check_report_period(s: Strategy, out: _Collector) -> None:
+    if not s.report_period:
+        return
+    from ..data.periods import parse_report, report_deadline, report_label, today_cn
+
+    try:
+        y, q = parse_report(s.report_period)
+    except ValueError as e:
+        out.add("error", "implausible", [], f"报告期“{s.report_period}”无效：{e}", "改为 yyyy-1 ~ yyyy-4，或选“自动”。", tag="report_period")
+        return
+    rep = f"{y}-{q}"
+    deadline = report_deadline(rep)
+    if today_cn() <= deadline:
+        out.add(
+            "warning", "data_coverage", [],
+            f"指定的报告期 {report_label(rep)} 法定披露截止日为 {deadline.isoformat()}，尚未到期：多数公司可能还没有披露，相关财务条件会大面积显示为“缺失”。",
+            "如需可比的全市场数据，选“自动”（取法定截止日已过的最近一期）。",
+            tag="report_period_future",
+        )
 
 
 def _strategy_warnings(s: Strategy) -> list[str]:

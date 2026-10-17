@@ -1,10 +1,10 @@
 import { BulbOutlined, LinkOutlined, ReadOutlined } from '@ant-design/icons';
-import { Alert, Button, Drawer, Empty, Skeleton, Space, Table, Tag, Typography } from 'antd';
+import { Alert, Button, Drawer, Empty, Skeleton, Space, Table, Tag, Tooltip, Typography } from 'antd';
 import type { TableColumnsType } from 'antd';
 import { useEffect, useMemo, useState } from 'react';
 import { api, errorMessage } from '../api';
 import { useMetrics } from '../store';
-import type { Explanation, MetricValue, NewsResult, StockDetail, Strategy } from '../types';
+import type { Explanation, MetricValue, NewsItem, NewsResult, StockDetail, Strategy } from '../types';
 import { BUCKET_META, METRIC_STATUS_LABEL, fmtDateTime, fmtPlain, fmtWithUnit } from '../utils/format';
 import { condMap } from '../utils/result';
 import { Chart, esc, type ChartOption } from './Chart';
@@ -64,6 +64,15 @@ function PriceChart({ detail }: { detail: StockDetail }) {
   return <Chart option={option} height={260} />;
 }
 
+const NEWS_NOTE = '第三方资讯，仅作背景参考，可能含预测或评级，不代表本产品观点，数值口径可能与筛选数据不同；不参与筛选与打分';
+
+/** 标题/摘要含预测、评级、荐股类措辞的资讯：标“含第三方观点” */
+const THIRD_PARTY_VIEW_RE = /预测|评级|目标价|买入|增持|推荐|有望|看好|跑赢|首次覆盖|预计/;
+
+function hasThirdPartyView(it: NewsItem): boolean {
+  return THIRD_PARTY_VIEW_RE.test(`${it.title ?? ''} ${it.summary ?? ''}`);
+}
+
 function NewsBlock({ news, loading, error }: { news: NewsResult | null; loading: boolean; error: string | null }) {
   if (loading) return <Skeleton active paragraph={{ rows: 3 }} />;
   if (error) return <Alert type="error" showIcon message="资讯获取失败" description={error} />;
@@ -79,6 +88,13 @@ function NewsBlock({ news, loading, error }: { news: NewsResult | null; loading:
       {(news.items ?? []).map((it, i) => (
         <div className="news-item" key={`${it.title}-${i}`}>
           <div>
+            {hasThirdPartyView(it) && (
+              <Tooltip title="标题或摘要含预测、评级或买卖类表述，属于第三方观点，不是本产品的结论">
+                <Tag color="orange" className="tag-mini">
+                  含第三方观点
+                </Tag>
+              </Tooltip>
+            )}
             {it.url ? (
               <a href={it.url} target="_blank" rel="noopener noreferrer">
                 {it.title} <LinkOutlined />
@@ -277,9 +293,9 @@ export function StockDrawer({ open, runId, thscode, strategy, onClose }: Props) 
           <div>
             <div className="section-title">
               <ReadOutlined /> iFinD 资讯
-              <Tag color="default" style={{ marginLeft: 4 }}>
-                仅背景参考，不参与筛选与打分
-              </Tag>
+            </div>
+            <div className="chart-note" style={{ marginBottom: 6 }}>
+              {NEWS_NOTE}
             </div>
             <NewsBlock news={news} loading={newsLoading} error={newsError} />
             {news?.note && (

@@ -484,6 +484,24 @@ def _scan_lexicon(mask: _Mask) -> list[_LexHit]:
     return hits
 
 
+FORECAST_METRIC = re.compile(
+    r"(?:预测|预期|一致预期|前瞻|远期)\s*(?:市盈率|PE|EPS|每股收益|净利润|利润|营收|收入|增速)|一致预期", re.IGNORECASE,
+)
+FORECAST_REASON = "预测/一致预期类指标需要分析师一致预期数据，当前数据源未提供，无法筛选"
+FORECAST_ALTERNATIVE = "可改用历史口径，例如“市盈率TTM 处于行业较低分位”“最新报告期净利润同比为正”"
+
+
+def _scan_forecast(mask: _Mask) -> list[Unsupported]:
+    """“预测市盈率/一致预期EPS”：无一致预期数据 → unsupported，并屏蔽该片段（先于词典扫描）。"""
+    out: list[Unsupported] = []
+    for m in FORECAST_METRIC.finditer(mask.view()):
+        if m.end() > m.start() and mask.free(m.start(), m.end()):
+            mask.take(m.start(), m.end())
+            if all(u.phrase != m.group(0) for u in out):
+                out.append(Unsupported(phrase=m.group(0), reason=FORECAST_REASON, alternative=FORECAST_ALTERNATIVE))
+    return out
+
+
 def _scan_unsupported(mask: _Mask) -> list[Unsupported]:
     out: list[Unsupported] = []
     for pat, reason, alt in catalog.UNSUPPORTED_HINTS:
@@ -590,6 +608,9 @@ async def parse(query: str, base_strategy: Strategy | None = None, searcher: Uni
         result = await parse_rules(q, searcher)
     if notice is not None:
         result.compliance = notice
+        hint = compliance.history_warning(notice)
+        if hint and result.strategy is not None and hint not in result.warnings:
+            result.warnings = [hint, *result.warnings]
     return result
 
 
@@ -624,8 +645,9 @@ async def parse_rules(query: str, searcher: UniverseSearcher | None = None) -> P
     mask = _Mask(q)
     uni_hits = _scan_universe_lexicon(mask)
     risk = _scan_risk(mask)
+    forecast = _scan_forecast(mask)
     lex = _scan_lexicon(mask)
-    unsupported = _scan_unsupported(mask)
+    unsupported = forecast + _scan_unsupported(mask)
     ud = await _universe_from_text(q, mask, uni_hits, searcher)
     unsupported += ud.unsupported
     warnings = list(ud.warnings)
@@ -681,6 +703,44 @@ _CATEGORY_WORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (r"净利率", ("net_margin",)),
     (r"Beta|贝塔|防御", ("beta_250d",)),
 )
+_MOD_VERB = re.compile(
+    rf"{_REMOVE.pattern}|{_LOOSEN.pattern}|{_TIGHTEN.pattern}|调整为|调整到|调到|调成|调为|改成|改为|改到|设为|设成"
+)
+
+
+def _clause_categories(clause: str) -> list[tuple[str, set[str]]]:
+    """分句里提到的指标类别：(原文用词, 对应指标 id)。类别词优先，其次指标名/别名。"""
+    out: list[tuple[str, set[str]]] = []
+    covered: set[str] = set()
+    for pat, mids in _CATEGORY_WORDS:
+        m = re.search(pat, clause, re.IGNORECASE)
+        if m:
+            out.append((m.group(0), set(mids)))
+            covered.update(mids)
+    low = clause.lower()
+    for md in catalog.METRICS.values():
+        if md.id in covered:
+            continue
+        name = next((n for n in [md.name, *md.aliases] if n and n.lower() in low), None)
+        if name:
+            out.append((name, {md.id}))
+    return out
+
+
+def missing_category_warnings(query: str, strategies: Sequence[Strategy]) -> list[str]:
+    """修改句里有删除/调整动词、但所给策略中都没有该类别的条件 → “当前策略中没有××条件，该部分未生效。”"""
+    present = {c.metric for st in strategies for c in st.conditions}
+    out: list[str] = []
+    for clause in _CLAUSE_SPLIT.split(query or ""):
+        if not clause.strip() or not _MOD_VERB.search(clause):
+            continue
+        for word, mids in _clause_categories(clause):
+            msg = f"当前策略中没有{word}条件，该部分未生效。"
+            if not (mids & present) and msg not in out:
+                out.append(msg)
+    return out
+
+
 _ST_EXCLUDE = re.compile(r"(?:剔除|排除|去掉|去除|不要|不含|不包括|过滤掉?)\s*\*?ST股?(?!\s*(?:条件|限制|过滤))", re.IGNORECASE)
 _ST_KEEP = re.compile(
     r"(?:保留|包含|包括|不剔除|不排除|允许)\s*\*?ST股?|(?:去掉|删除|删掉|移除|取消)\s*\*?ST\s*(?:条件|限制|过滤)", re.IGNORECASE,
@@ -816,6 +876,13 @@ class _Modifier:
         metrics = _metrics_in(body)
         return [i for i, c in enumerate(self.conds) if c.metric in metrics]
 
+    def _absent(self, clause: str) -> bool:
+        """要删除/调整的类别在当前策略中不存在 → 写 warning（该部分未生效），返回 True。"""
+        current = self.base.model_copy(update={"conditions": self.conds})
+        msgs = missing_category_warnings(clause, [current])
+        self.warnings += [m for m in msgs if m not in self.warnings]
+        return bool(msgs)
+
     def _generic(self, text: str) -> bool:
         body = _TARGET_VALUE.sub(" ", _ACTION_WORDS.sub(" ", text))
         return bool(_GENERIC_BODY.match(body))
@@ -828,9 +895,10 @@ class _Modifier:
         if not targets and mode != "set" and self._generic(text):
             targets = [i for i, c in enumerate(self.conds) if c.enabled and c.origin != "system" and op_family(c.op) != "bool"]
         if not targets:
-            self.unsupported.append(Unsupported(
-                phrase=clause, reason=f"没有找到要{verb}的条件", alternative=f"请写明指标或原短语，例如“{verb}估值”“{verb}波动率”",
-            ))
+            if not self._absent(clause):
+                self.unsupported.append(Unsupported(
+                    phrase=clause, reason=f"没有找到要{verb}的条件", alternative=f"请写明指标或原短语，例如“{verb}估值”“{verb}波动率”",
+                ))
             return
         explicit = _TARGET_VALUE.search(text)
         applied = False
@@ -909,9 +977,10 @@ class _Modifier:
     def _remove(self, text: str, clause: str) -> None:
         targets = self._targets(text)
         if not targets:
-            self.unsupported.append(Unsupported(
-                phrase=clause, reason="没有找到要删除的条件", alternative="请写明指标或原短语，例如“去掉回撤条件”“删除估值合理”",
-            ))
+            if not self._absent(clause):
+                self.unsupported.append(Unsupported(
+                    phrase=clause, reason="没有找到要删除的条件", alternative="请写明指标或原短语，例如“去掉回撤条件”“删除估值合理”",
+                ))
             return
         drop = set(targets)
         for i in sorted(drop):

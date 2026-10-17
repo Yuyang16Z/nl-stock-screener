@@ -95,10 +95,13 @@ function FunnelView({ funnel }: { funnel: FunnelStep[] }) {
 function SweepChart({
   stat,
   unit,
+  axisName,
   onPick,
 }: {
   stat: ConditionStat;
   unit: string;
+  /** 横轴含义：普通阈值为“阈值”，between 条件后端扫描的是“上界” */
+  axisName: string;
   onPick: (value: number) => void;
 }) {
   const pts = useMemo(() => [...(stat.sweep ?? [])].sort((a, b) => a.value - b.value), [stat.sweep]);
@@ -111,7 +114,7 @@ function SweepChart({
         formatter: (p: unknown) => {
           const v = (p as { value: [number, number] }).value;
           const cur = pts.find((x) => x.value === v[0])?.is_current;
-          return `阈值 ${esc(fmtPlain(v[0]))}${esc(unit)}<br/>入选 ${v[1]} 只${cur ? '（当前）' : ''}<br/><span style="color:#999">点击带入试算</span>`;
+          return `${esc(axisName)} ${esc(fmtPlain(v[0]))}${esc(unit)}<br/>入选 ${v[1]} 只${cur ? '（当前）' : ''}<br/><span style="color:#999">点击带入试算</span>`;
         },
       },
       xAxis: {
@@ -143,7 +146,7 @@ function SweepChart({
         },
       ],
     }),
-    [pts, unit],
+    [pts, unit, axisName],
   );
   return (
     <Chart
@@ -245,9 +248,16 @@ export function ImpactPanel({ result, onOpen }: { result: ScreenResult; onOpen: 
   const selCond = wi.condId ? cmap.get(wi.condId) : undefined;
   const selMetric = selCond ? metrics[selCond.metric] : undefined;
 
-  const pickCond = (id: string, value?: number) => {
+  /** picked = 扫描图上点中的值。between 条件后端扫描的是上界：写入 value2，下界保持不变 */
+  const pickCond = (id: string, picked?: number) => {
     const c = cmap.get(id);
-    setWi({ ...WI_INIT, condId: id, value: value ?? c?.value ?? null, value2: c?.value2 ?? null });
+    const isBetween = c?.op === 'between';
+    setWi({
+      ...WI_INIT,
+      condId: id,
+      value: picked != null && !isBetween ? picked : c?.value ?? null,
+      value2: picked != null && isBetween ? picked : c?.value2 ?? null,
+    });
   };
 
   const runWhatIf = async (strategy: Strategy, desc: string) => {
@@ -527,7 +537,7 @@ export function ImpactPanel({ result, onOpen }: { result: ScreenResult; onOpen: 
               </Button>
             </Space>
             <div className="chart-note" style={{ marginTop: 8 }}>
-              试算复用本次数据快照，只重新判定，不改动当前条件；确认后可“采用此修改”。也可以点击下方扫描图上的点带入阈值。
+              试算复用本次数据快照，只重新判定，不改动当前条件；确认后可“采用此修改”。也可以点击下方扫描图上的点带入阈值（区间条件带入的是上界）。
             </div>
             {wi.error && <Alert style={{ marginTop: 8 }} type="error" showIcon message="试算失败" description={wi.error} />}
             {resp && diff && (
@@ -589,21 +599,28 @@ export function ImpactPanel({ result, onOpen }: { result: ScreenResult; onOpen: 
       {sweepStats.length > 0 && (
         <div>
           <div className="section-title">
-            阈值扫描 <span className="muted">（横轴为阈值，纵轴为其余条件不变时的入选数；橙点为当前阈值）</span>
+            阈值扫描 <span className="muted">（横轴为阈值，区间条件为上界；纵轴为其余条件不变时的入选数；橙点为当前阈值）</span>
           </div>
           <div className="sweep-grid">
             {sweepStats.map((s) => {
               const c = cmap.get(s.condition_id);
               const unit = c && isRankOp(c.op) ? '分位' : c ? metrics[c.metric]?.unit ?? '' : '';
+              const axisName = c?.op === 'between' ? '上界' : '阈值';
               return (
                 <Card
                   size="small"
                   className="sweep-card"
                   key={s.condition_id}
                   title={s.label || label(s.condition_id)}
-                  extra={<span className="chart-note">横轴：阈值{unit ? `（${unit}）` : ''}</span>}
+                  extra={
+                    <span className="chart-note">
+                      横轴：{axisName}
+                      {unit ? `（${unit}）` : ''}
+                      {c?.op === 'between' ? '，下界不变' : ''}
+                    </span>
+                  }
                 >
-                  <SweepChart stat={s} unit={unit} onPick={(v) => pickCond(s.condition_id, v)} />
+                  <SweepChart stat={s} unit={unit} axisName={axisName} onPick={(v) => pickCond(s.condition_id, v)} />
                 </Card>
               );
             })}

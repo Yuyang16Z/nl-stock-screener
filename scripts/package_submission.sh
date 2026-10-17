@@ -6,7 +6,7 @@ OUT="${1:-$ROOT/../第一题_ScreenLens_提交.zip}"
 TMP="$(mktemp -d)"
 mkdir -p "$TMP/ScreenLens"
 git -C "$ROOT" archive --format=tar HEAD | tar -x -C "$TMP/ScreenLens"
-cp "$ROOT/docs/提交说明.md" "$TMP/" 2>/dev/null || true
+cp "$ROOT/docs/SUBMISSION.md" "$TMP/SUBMISSION.md"
 rm -f "$OUT"
 (cd "$TMP" && zip -qr "$OUT" .)
 rm -rf "$TMP"

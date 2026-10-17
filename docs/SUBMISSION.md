@@ -8,6 +8,7 @@
 | 测试说明 | `ScreenLens/docs/TESTING.md` |
 | 数据口径与真实接口核验 | `ScreenLens/docs/DATA_SOURCES.md` |
 | 设计规格（职责边界、模块契约） | `ScreenLens/docs/DESIGN.md` |
+| 可追溯性核验报告 | `ScreenLens/docs/VERIFICATION_RUN.md` |
 
 ## 三分钟体验路径
 

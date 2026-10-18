@@ -12,6 +12,7 @@ from app.catalog import DATASETS, DISPLAY_METRICS
 from app.data.cache import ApiCache
 from app.data.fuyao import FuyaoClient, FuyaoError
 from app.data.repository import INDUSTRY_PICK_RULE, Repository, merge_dataset_status, pick_industry
+from app.engine.evaluate import evaluate
 from app.schemas import Condition, DatasetStatus, Strategy, Universe
 
 try:
@@ -64,9 +65,11 @@ async def test_build_snapshot_fetches_only_needed_datasets() -> None:
 
     st = ds_map(snap)
     assert [d.dataset for d in snap.datasets] == list(DATASETS)
-    for name in ("constituents", "tickers", "industry_map", "valuations", "indicators", "indicators_yoy", "history"):
+    # 估值类指标会顺带取行情快照（每 100 只 1 次），用于识别停牌（成交量为 0）
+    for name in ("constituents", "tickers", "industry_map", "valuations", "snapshot", "indicators", "indicators_yoy", "history"):
         assert st[name].status == "ok", name
-    for name in ("snapshot", "income", "benchmark", "dividends"):
+    assert client.count("snapshot") == 1
+    for name in ("income", "benchmark", "dividends"):
         assert st[name].status == "skipped", name
         assert client.count(name) == 0
     assert st["indicators"].requested == 4 and st["indicators"].succeeded == 4
@@ -274,6 +277,145 @@ async def test_suspended_stock_is_stale_and_trade_date_is_mode() -> None:
     for code in ("600001.SH", "000003.SZ", "300004.SZ"):
         assert snap.stocks[code].metrics["return_20d"].stale is False
         assert snap.stocks[code].metrics["beta_250d"].status == "ok"
+
+
+SUSPENDED = "600002.SH"
+SUSPENDED_NOTE = "该股最近交易日为 2026-09-30，早于市场最近交易日 2026-10-16（可能停牌），估值为停牌前数值"
+
+
+def suspended_market() -> SyntheticMarket:
+    market = SyntheticMarket()
+    market.history_end[SUSPENDED] = date(2026, 9, 30)  # 模拟停牌：日K停在 9-30，快照/估值仍是停牌前数值
+    return market
+
+
+async def test_suspended_stock_valuations_are_stale_and_never_pass() -> None:
+    conds = (
+        Condition(id="c1", metric="pe_ttm", op="lt", value=30),
+        Condition(id="c2", metric="market_cap_est", op="gt", value=0),
+        Condition(id="c3", metric="dividend_yield_ttm", op="gte", value=0),
+        Condition(id="c4", metric="return_20d", op="gt", value=-100),
+    )
+    repo, _, _ = make_repo(suspended_market())
+    snap = await repo.build_snapshot(strategy(*conds), faults=set())
+    m = snap.stocks[SUSPENDED].metrics
+    for mid in ("pe_ttm", "pb_mrq", "market_cap_est"):
+        assert m[mid].status == "ok" and m[mid].stale is True and m[mid].reason == SUSPENDED_NOTE, mid
+    assert m["pe_ttm"].evidence.as_of.date() == date(2026, 9, 30)
+    assert m["dividend_yield_ttm"].stale is True and "行情快照为停牌前数值" in (m["dividend_yield_ttm"].reason or "")
+    for code in ("600001.SH", "000003.SZ", "300004.SZ"):
+        assert not any(snap.stocks[code].metrics[mid].stale for mid in ("pe_ttm", "market_cap_est", "dividend_yield_ttm")), code
+    out = evaluate(strategy(*conds), snap)
+    bad = next(sr for sr in out.missing if sr.thscode == SUSPENDED)
+    by_id = {e.condition_id: e for e in bad.evaluations}
+    for cid in ("c1", "c2", "c3", "c4"):
+        assert by_id[cid].status == "missing" and "可能停牌" in (by_id[cid].reason or ""), cid
+    assert by_id["c1"].reason == f"数据时点过期（{SUSPENDED_NOTE}），不参与判定"
+    assert SUSPENDED not in {sr.thscode for sr in out.included}
+
+
+async def test_suspension_marked_consistently_across_incremental_phases() -> None:
+    repo, _, _ = make_repo(suspended_market())
+    pe_only = strategy(Condition(id="c1", metric="pe_ttm", op="lt", value=30))
+    # 先只取估值（未取日K → 不判断），再补价格窗口指标（全A预筛后深度取数 / what-if 的路径）
+    base = await repo.build_snapshot(pe_only, faults=set(), metrics={"pe_ttm"})
+    assert base.stocks[SUSPENDED].metrics["pe_ttm"].stale is False
+    merged = await repo.build_snapshot(pe_only, faults=set(), metrics={"pe_ttm", "return_20d"}, base=base)
+    pe = merged.stocks[SUSPENDED].metrics["pe_ttm"]
+    assert pe.stale is True and pe.reason == SUSPENDED_NOTE and pe.value == pytest.approx(5.2)
+    assert pe.evidence.period.startswith("该股最近交易日 2026-09-30 收盘（停牌前数值")
+    assert base.stocks[SUSPENDED].metrics["pe_ttm"].stale is False  # 不修改基准快照
+    assert merged.stocks["600001.SH"].metrics["pe_ttm"].stale is False
+    # 反过来：基准快照已取日K，本次只补估值/快照类指标（不再取日K）→ 用同一交易日的基准快照推断
+    later = await repo.build_snapshot(pe_only, faults=set(), metrics={"pe_ttm", "return_20d", "dividend_yield_ttm", "ps_ttm"}, base=merged)
+    for mid in ("dividend_yield_ttm", "ps_ttm"):
+        assert later.stocks[SUSPENDED].metrics[mid].stale is True, mid
+        assert later.stocks["600001.SH"].metrics[mid].stale is False, mid
+    # 基准快照来自更早的交易日时不推断（避免把旧数据误判为停牌）
+    old = merged.model_copy(update={"trade_date": "2026-10-15"})
+    other_day = await repo.build_snapshot(pe_only, faults=set(), metrics={"pe_ttm", "return_20d", "ps_ttm"}, base=old)
+    assert other_day.stocks[SUSPENDED].metrics["ps_ttm"].stale is False
+
+
+async def test_all_a_two_phase_run_marks_suspension_and_explains_skips() -> None:
+    from app.schemas import ScreenRequest
+    from app.services.runs import RunManager
+
+    market = SyntheticMarket()
+    market.history_end["600001.SH"] = date(2026, 9, 30)
+    repo, _, _ = make_repo(market)
+    mgr = RunManager(make_settings(), repo)
+    s = Strategy(universe=Universe(kind="all_a"), conditions=[
+        Condition(metric="is_st", op="is_false"),
+        Condition(metric="pe_ttm", op="between", value=0, value2=30),
+        Condition(metric="volatility_250d", op="lt", value=80),
+    ])
+    res = await mgr.wait(mgr.start(ScreenRequest(strategy=s)), 30)
+    assert res.status == "done", res.error
+    ev = {sr.thscode: {e.condition_id: e for e in sr.evaluations} for sr in [*res.included, *res.excluded, *res.missing]}
+    pe_label = next(c.label for c in res.strategy.conditions if c.metric == "pe_ttm")
+    # 预筛阶段的估值在深度取数拿到日K后按停牌补标过期：不能以停牌前估值判为通过
+    assert ev["600001.SH"]["c2"].status == "missing" and "估值为停牌前数值" in (ev["600001.SH"]["c2"].reason or "")
+    assert "600001.SH" not in {sr.thscode for sr in res.included}
+    # 被前置条件排除 vs 前置条件数据缺失
+    assert ev["300004.SZ"]["c3"].status == "skipped"
+    assert ev["300004.SZ"]["c3"].reason == f"已被前置条件排除（未通过：「{pe_label}」），未取数"
+    assert ev["000008.SZ"]["c3"].reason == f"前置条件数据缺失（「{pe_label}」），未进入深度评估"
+    deep = next(st for st in res.condition_stats if st.condition_id == "c3")
+    assert deep.skipped > 0 and "未评估" in (deep.note or "")
+
+
+async def test_no_dividend_events_counts_as_success_and_zero_yield() -> None:
+    market = SyntheticMarket()
+
+    def no_events(path: str, params: dict[str, Any], ds: str) -> FuyaoError | None:
+        if ds == "dividends" and params.get("thscode") == "000003.SZ":
+            return FuyaoError("No adjustment events for thscode=000003.SZ", kind="not_ready", code=3002,
+                              request_id="rid-nodiv", endpoint=path, dataset=ds, params=params)
+        return None
+
+    market.fail_rules.append(no_events)
+    market.fail_rules.append(fail_when("dividends", "300004.SZ", code=3002, kind="not_ready", request_id="rid-notready"))
+    repo, _, _ = make_repo(market)
+    s = strategy(Condition(id="c1", metric="dividend_yield_ttm", op="gte", value=3))
+    snap = await repo.build_snapshot(s, faults=set())
+    st = ds_map(snap)["dividends"]
+    # “无分红事件”计为成功；其他 3002 仍是失败
+    assert st.status == "partial" and (st.requested, st.succeeded, st.failed) == (4, 3, 1)
+    assert st.errors == ["300004.SZ: code=3002 数据未就绪 (request_id=rid-notready)"]
+    assert "1 只数据源无分红事件记录" in (st.note or "")
+    mv = snap.stocks["000003.SZ"].metrics["dividend_yield_ttm"]
+    assert mv.status == "ok" and mv.value == 0.0
+    assert "数据源无分红事件记录（code=3002，request_id=rid-nodiv），按 0 处理" in (mv.evidence.note or "")
+    assert snap.stocks["300004.SZ"].metrics["dividend_yield_ttm"].status == "missing"
+    out = evaluate(s, snap)
+    assert "000003.SZ" in {sr.thscode for sr in out.excluded}  # 股息率 0% < 3%：不满足，而不是“数据缺失”
+    assert {sr.thscode for sr in out.missing} == {"300004.SZ"}
+    # 只有“无分红事件”时数据集为 ok
+    market.fail_rules.pop()
+    clean = ds_map(await repo.build_snapshot(s, faults=set()))["dividends"]
+    assert clean.status == "ok" and clean.failed == 0 and clean.errors == []
+
+
+async def test_industry_map_failure_makes_industry_rank_missing() -> None:
+    repo, _, _ = make_repo()
+    s = strategy(
+        Condition(id="c1", metric="pe_ttm", op="pct_rank_lte", value=50, rank_scope="industry"),
+        Condition(id="c2", metric="pb_mrq", op="pct_rank_lte", value=50, rank_scope="market"),
+    )
+    snap = await repo.build_snapshot(s, faults={"industry_map"})
+    assert ds_map(snap)["industry_map"].status == "failed"
+    out = evaluate(s, snap)
+    for sr in [*out.included, *out.excluded, *out.missing]:
+        by_id = {e.condition_id: e for e in sr.evaluations}
+        c1 = by_id["c1"]
+        if c1.value is not None and c1.value > 0:
+            assert c1.status == "missing", sr.thscode
+            assert (c1.reason or "").startswith("行业归属数据获取失败：") and "code=5003" in (c1.reason or ""), sr.thscode
+            assert "演示故障注入" in (c1.reason or "")
+        assert by_id["c2"].status in ("pass", "fail", "not_applicable")  # 全A分位不依赖行业归属
+    st = next(x for x in out.condition_stats if x.condition_id == "c1")
+    assert (st.missing, st.not_applicable) == (3, 1)  # 只有负 PE 的 000003.SZ 是“不适用”
 
 
 async def test_benchmark_fault_only_breaks_beta() -> None:

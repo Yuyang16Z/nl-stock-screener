@@ -414,11 +414,19 @@ class RunManager:
             affected = [
                 c.label or c.metric
                 for c in enabled
-                if ds.dataset in METRICS[c.metric].datasets or (ds.dataset == "industry_map" and c.rank_scope == "industry")
+                if ds.dataset in METRICS[c.metric].datasets
+                # 行业内分位依赖行业归属：行业映射失败时这些条件按数据缺失处理（evaluate 写明“行业归属数据获取失败”）
+                or (ds.dataset == "industry_map" and c.op in catalog.RANK_OPS and c.rank_scope == "industry")
             ]
             if ds.dataset in ("tickers", "industry_map"):
                 affected = affected or ["（股票名称/行业归属）"]
             what = "部分失败" if ds.status == "partial" else "失败"
+            if ds.dataset in ("indicators", "indicators_yoy") and snap.report_period is not None:
+                from ..data.periods import report_deadline as _deadline, today_cn as _today
+
+                rep = snap.report_period.report if ds.dataset == "indicators" else snap.report_period.yoy_report
+                if _today() <= _deadline(rep):
+                    what += f"（{rep} 尚未到法定披露截止日 {_deadline(rep).isoformat()}，多数公司可能尚未披露）"
             stat = f"（成功 {ds.succeeded}/{ds.requested}）" if ds.requested else ""
             out.append(f"{ds.label} 数据{what}{stat}，受影响条件：{'、'.join(affected) if affected else '无（仅影响展示指标）'}；相关股票按数据缺失处理")
         if snap.universe.kind == "custom" and snap.universe.note:

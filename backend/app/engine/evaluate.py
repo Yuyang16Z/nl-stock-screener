@@ -1,7 +1,8 @@
 """确定性判定：逐股逐条件状态、分桶、软分排序、漏斗、条件统计（DESIGN §5.3）。
 
 判定语义：
-- 指标键不存在：快照为预筛模式（prefiltered）→ skipped“已被前置条件排除，未取数”；否则 missing“未获取该指标”；
+- 指标键不存在：快照为预筛模式（prefiltered）→ skipped，原因区分“已被前置条件排除（未通过：××），未取数”
+  与“前置条件数据缺失（××），未进入深度评估”（无法归因时为“已被前置条件排除，未取数”）；否则 missing“未获取该指标”；
 - 指标 status=missing/error → missing（error 的原因带错误信息）；not_applicable → not_applicable；
 - 指标 ok 但值为空/非有限数/类型不符 → missing；stale（过期）→ missing（过期数据不判为通过）；
 - 其余按算子判定 pass/fail；数值判定、分位、margin 一律调用 engine/ops.py。
@@ -60,8 +61,15 @@ REASON_NO_REFERENCE = "参考组数据不可用"
 REASON_NO_INDUSTRY = "行业归属未知"
 REASON_INDUSTRY_FAILED = "行业归属数据获取失败"
 
+# 全A预筛的“前置条件”= 启用的硬条件中只依赖廉价数据集（代码表/行情/估值快照）的指标，与 services 的预筛口径一致
+_CHEAP_METRICS: frozenset[str] = frozenset(
+    m for m, d in catalog.METRICS.items() if set(d.datasets) <= set(catalog.CHEAP_DATASETS)
+)
+_MAX_NAMED_CONDITIONS = 3
+
 # data_coverage 计数前去掉逐股/逐次不同的部分，同一错误码与类别合并计数（样例保留一个 request_id）
 _RID_RE = re.compile(r"request_id=[^\s)）,，;；]+")
+_REAL_RID_RE = re.compile(r"request_id=(?!--)[^\s)）,，;；]+")  # “--”为无 request_id 的占位（如演示故障注入）
 _CODE_RE = re.compile(r"(?<![0-9A-Za-z])\d{6}\.(?:SH|SZ|BJ)(?![A-Za-z])", re.IGNORECASE)
 _ATTEMPTS_RE = re.compile(r"（共尝试 \d+ 次）")
 
@@ -178,15 +186,14 @@ def _build_column(cond: Condition, codes: list[str], snap: FeatureSnapshot) -> C
 
 
 def _industry_failure(snap: FeatureSnapshot) -> str | None:
-    """行业归属数据集（industry_map）失败 / 部分失败时的原因（含错误样例），否则 None。"""
+    """行业归属数据集（industry_map）失败 / 部分失败时，“无行业”股票的缺失原因（含错误码与 request_id），否则 None。"""
     ds = next((d for d in snap.datasets if d.dataset == "industry_map"), None)
     if ds is None or ds.status not in ("failed", "partial"):
         return None
     err = ds.errors[0] if ds.errors else "原因未知"
-    text = f"{REASON_INDUSTRY_FAILED}：{err}"
-    if ds.status == "partial":
-        text += f"（部分失败，成功 {ds.succeeded}/{ds.requested}，该股行业归属未取得）"
-    return text
+    if ds.status == "partial":  # 错误样例不一定是该股所属行业的请求，写明是部分失败的样例
+        return f"{REASON_INDUSTRY_FAILED}：部分失败（成功 {ds.succeeded}/{ds.requested}，错误样例 {err}），该股未取得行业归属"
+    return f"{REASON_INDUSTRY_FAILED}：{err}"
 
 
 def _judge_rank(col: CondColumn, codes: list[str], snap: FeatureSnapshot, usable: list[int]) -> None:
@@ -284,7 +291,42 @@ def build_matrix(strategy: Strategy, snap: FeatureSnapshot, *, conditions: list[
         raise InvalidStrategyError(problems)
     codes = sorted(snap.stocks)
     columns = [_build_column(c, codes, snap) for c in conds]
+    if snap.prefiltered:
+        _explain_prefilter_skips(columns)
     return EvalMatrix(strategy=ns, codes=codes, columns=columns, keep_flagged=ns.missing_policy == "keep_flagged")
+
+
+def _join_labels(labels: list[str]) -> str:
+    shown = "、".join(f"「{x}」" for x in labels[:_MAX_NAMED_CONDITIONS])
+    return shown if len(labels) <= _MAX_NAMED_CONDITIONS else f"{shown} 等 {len(labels)} 条"
+
+
+def _prefilter_skip_reason(pre: list[CondColumn], i: int) -> str:
+    """预筛模式下第 i 只股票的深度条件为何未取数。
+
+    前置条件有未通过 → 被条件排除；没有未通过、只是数据缺失/不适用 → 无法判定而未进入深度评估（不是“被排除”）。
+    """
+    failed = [c.cond.label or c.cond.id for c in pre if c.status[i] == FAIL]
+    if failed:
+        return f"已被前置条件排除（未通过：{_join_labels(failed)}），未取数"
+    lacking = [c for c in pre if c.status[i] in (MISSING, NA)]
+    if lacking:
+        what = "数据缺失" if all(c.status[i] == MISSING for c in lacking) else "数据缺失或不适用"
+        return f"前置条件{what}（{_join_labels([c.cond.label or c.cond.id for c in lacking])}），未进入深度评估"
+    return REASON_SKIPPED
+
+
+def _explain_prefilter_skips(columns: list[CondColumn]) -> None:
+    """把 skipped 单元格的通用原因细化为该股在前置条件上的实际情况（每只股票只算一次）。"""
+    pre = [col for col in columns if col.cond.hard and col.cond.metric in _CHEAP_METRICS]
+    memo: dict[int, str] = {}
+    for col in columns:
+        for i in np.nonzero(col.status == SKIPPED)[0].tolist():
+            if col.reasons[i] != REASON_SKIPPED:
+                continue
+            if i not in memo:
+                memo[i] = _prefilter_skip_reason(pre, i)
+            col.reasons[i] = memo[i]
 
 
 def prefilter(strategy: Strategy, snap: FeatureSnapshot, cheap_metrics: set[str]) -> list[str]:
@@ -353,6 +395,9 @@ def _condition_stats(m: EvalMatrix, compute_stats: bool) -> list[ConditionStat]:
     for j, col in enumerate(m.columns):
         counts = np.bincount(col.status, minlength=5).tolist()
         notes = list(col.notes)
+        if counts[SKIPPED]:
+            who = f"全部 {counts[SKIPPED]} 只" if counts[SKIPPED] == len(m.codes) else f" {counts[SKIPPED]} 只"
+            notes.append(f"预筛模式：该条件对{who}股票未评估（前置条件未通过或数据缺失，未取数），这些股票不计入通过/未通过")
         stat = ConditionStat(
             condition_id=col.cond.id, label=col.cond.label or col.cond.id, hard=col.cond.hard,
             passed=counts[PASS], failed=counts[FAIL], missing=counts[MISSING],
@@ -386,13 +431,13 @@ def _reason_key(reason: str) -> str:
 
 
 def _top_reason(reasons: list[str]) -> tuple[str, int, bool]:
-    """最常见的原因组 → (样例原文（保留其中一个 request_id）, 只数, 样例是否含 request_id)。并列时取先出现的组。"""
+    """最常见的原因组 → (样例原文（保留其中一个 request_id）, 只数, 样例是否含真实 request_id)。并列时取先出现的组。"""
     groups: dict[str, list[str]] = {}
     for r in reasons:
         groups.setdefault(_reason_key(r), []).append(r)
     members = max(groups.values(), key=len)  # dict 保序 + max 取首个最大 → 确定性
-    sample = next((r for r in members if _RID_RE.search(r)), members[0])
-    return sample, len(members), bool(_RID_RE.search(sample))
+    sample = next((r for r in members if _REAL_RID_RE.search(r)), members[0])
+    return sample, len(members), bool(_REAL_RID_RE.search(sample))
 
 
 def _coverage_conflicts(m: EvalMatrix) -> list[Conflict]:

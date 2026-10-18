@@ -35,10 +35,13 @@ from ..schemas import (
 )
 from .features import (
     REFERENCE_FIELDS,
+    SUSPENSION_METRICS,
     Fetched,
     StockRaw,
     compute_stock_metrics,
+    last_bar_from_metrics,
     latest_bar_date,
+    mark_suspended,
     market_trade_date,
     reference_value,
 )
@@ -316,6 +319,35 @@ def _ok_count(br: BatchResult, codes: Iterable[str]) -> int:
 def clean_codes(codes: Iterable[str]) -> list[str]:
     """标准化（去空格、大写）并保留合法 A 股代码（六位数字 + .SH/.SZ/.BJ），去重保序。"""
     return _unique(c for c in (str(x).strip().upper() for x in codes) if A_SHARE_CODE_RE.match(c))
+
+
+def _mark_suspended_across_phases(
+    stocks: dict[str, StockFeatures],
+    codes: Iterable[str],
+    fresh_history: Mapping[str, Fetched],
+    base: FeatureSnapshot | None,
+    trade_date: date | None,
+) -> None:
+    """停牌一致性：估值/快照与日K在不同阶段取得时（全A预筛后深度取数、what-if 增量补指标），按同一口径补标过期。
+
+    该股最近交易日优先取本次新取的日K；本次未取日K时，只有基准快照与本次属于同一市场交易日，才用基准快照中
+    价格窗口指标的时点反推（避免跨交易日的旧数据造成误判）；都不可得时不判断（与单股计算“未取日K不判断”一致）。
+    同一次计算内已判断过的指标（stale=True）不重复处理；只替换本次新建的指标字典条目，不修改基准快照中的对象。
+    """
+    if trade_date is None:
+        return
+    same_day = base is not None and base.trade_date == trade_date.isoformat()
+    for code in codes:
+        last: date | None = None
+        if code in fresh_history:
+            last = latest_bar_date(fresh_history[code])
+        elif same_day and base is not None and code in base.stocks:
+            last = last_bar_from_metrics(base.stocks[code].metrics)
+        if last is None or last >= trade_date:
+            continue
+        mvs = stocks[code].metrics
+        for m in sorted(SUSPENSION_METRICS & mvs.keys()):
+            mvs[m] = mark_suspended(mvs[m], last, trade_date)
 
 
 def _ticker_row(item: Mapping[str, Any]) -> TickerRow | None:
@@ -1051,6 +1083,7 @@ class Repository:
         for code in need:
             prev = stocks.get(code)
             stocks[code] = StockFeatures(info=infos[code], metrics={**(prev.metrics if prev else {}), **new_metrics[code]})
+        _mark_suspended_across_phases(stocks, need, per_stock.get("history", {}), base, trade_date)
 
         new_statuses = [statuses.get(ds) or skipped_status(ds) for ds in DATASETS]
         if base is not None:

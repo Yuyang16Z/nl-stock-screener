@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+from fastapi.encoders import jsonable_encoder
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -156,7 +157,9 @@ def create_app(
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
-        return JSONResponse(status_code=422, content={"detail": exc.errors()})
+        # 前端按字符串展示 detail；原始校验信息放在 errors 里便于排查
+        errs = exc.errors()
+        return JSONResponse(status_code=422, content={"detail": _validation_text(errs), "errors": jsonable_encoder(errs)})
 
     @app.exception_handler(Exception)
     async def _unhandled(_request: Request, exc: Exception) -> JSONResponse:
@@ -185,3 +188,34 @@ def create_app(
 
 
 app = create_app()
+
+
+_VALIDATION_TEMPLATES = {
+    "missing": "缺少必填字段「{loc}」",
+    "literal_error": "字段「{loc}」的取值不在允许范围内{expected}",
+    "enum": "字段「{loc}」的取值不在允许范围内{expected}",
+    "float_parsing": "字段「{loc}」需要数字",
+    "int_parsing": "字段「{loc}」需要整数",
+    "float_type": "字段「{loc}」需要数字",
+    "int_type": "字段「{loc}」需要整数",
+    "bool_parsing": "字段「{loc}」需要布尔值",
+    "string_type": "字段「{loc}」需要字符串",
+    "list_type": "字段「{loc}」需要列表",
+    "dict_type": "字段「{loc}」需要对象",
+    "model_type": "字段「{loc}」需要对象",
+    "json_invalid": "请求体不是合法的 JSON",
+    "string_too_long": "字段「{loc}」过长",
+}
+
+
+def _validation_text(errors: list[dict]) -> str:
+    """把 pydantic 校验错误转成中文、可操作的提示（最多列 3 条）。"""
+    parts: list[str] = []
+    for e in errors[:3]:
+        loc = ".".join(str(x) for x in e.get("loc", ()) if x not in ("body", "query", "path"))
+        ctx = e.get("ctx") or {}
+        expected = f"（允许：{ctx['expected']}）" if ctx.get("expected") else ""
+        tpl = _VALIDATION_TEMPLATES.get(str(e.get("type")), "字段「{loc}」不合法")
+        parts.append(tpl.format(loc=loc or "请求体", expected=expected))
+    more = f"等 {len(errors)} 处" if len(errors) > 3 else ""
+    return "请求参数有误：" + "；".join(parts) + more

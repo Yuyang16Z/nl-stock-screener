@@ -342,6 +342,12 @@ async def start_backtest(req: BacktestRequest, request: Request) -> dict[str, st
 
     today = today_cn()
     earliest = _date(today.year - 4, 1, 1) + _td(days=420)  # 日K取数窗口起点 + 约 250 个交易日预热
+    if req.end and req.end > today.isoformat():
+        raise HTTPException(400, f"回测结束日期不能晚于今天（{today.isoformat()}）")
+    import re as _re
+
+    if not _re.fullmatch(r"\d{6}\.(SH|SZ)", (req.benchmark or "").strip().upper()):
+        raise HTTPException(400, f"基准指数代码格式应为 6 位数字加 .SH/.SZ（如 000300.SH），收到 {req.benchmark!r}")
     if req.start > today.isoformat():
         raise HTTPException(400, f"回测开始日期不能晚于今天（{today.isoformat()}）")
     if req.start < earliest.isoformat():

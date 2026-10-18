@@ -8,7 +8,7 @@ import pytest
 
 from app.engine.conditions import strategy_hash
 from app.engine.evaluate import FUNNEL_NOTE, InvalidStrategyError, evaluate, prefilter
-from app.schemas import EvaluationOutput, StockResult
+from app.schemas import DatasetStatus, EvaluationOutput, StockResult
 from tests._fixtures_engine import error, make_snapshot, make_stock, make_strategy, missing, not_applicable, ok
 from tests._fixtures_engine import make_condition as C
 from tests._fixtures_engine import synthetic_snapshot
@@ -77,6 +77,24 @@ def test_stale_reason_falls_back_to_evidence_note():
     e = evals(out)["600001.SH"]
     assert e.status == "missing" and "可能停牌" in e.reason and e.display == "22.00%"
     assert codes(out.missing) == ["600001.SH"]
+
+
+def test_stale_valuation_never_passes_and_reason_carries_suspension_note():
+    note = "该股最近交易日为 2026-09-14，早于市场最近交易日 2026-10-16（可能停牌），估值为停牌前数值"
+    pe = ok("pe_ttm", 25.66, stale=True, reason=note)
+    cap = ok("market_cap_est", 504.6, stale=True, reason=note)
+    snap = make_snapshot([
+        make_stock("601059.SH", {"pe_ttm": pe, "market_cap_est": cap}),
+        make_stock("600001.SH", {"pe_ttm": 12.0, "market_cap_est": 800.0}),
+    ])
+    for policy in ("exclude", "keep_flagged"):
+        out = evaluate(make_strategy(C("pe_ttm", "lt", 30), C("market_cap_est", "gt", 0), policy=policy), snap)
+        for cid in ("c1", "c2"):
+            e = evals(out, cid)["601059.SH"]
+            assert e.status == "missing" and e.reason == f"数据时点过期（{note}），不参与判定", (policy, cid)
+            assert e.margin is None
+        assert evals(out, "c1")["600001.SH"].status == "pass"
+    assert codes(evaluate(make_strategy(C("pe_ttm", "lt", 30)), snap).missing) == ["601059.SH"]
 
 
 def test_bool_condition():
@@ -242,6 +260,40 @@ def test_rank_industry_group():
     assert ev["600005.SH"].status == "not_applicable" and "亏损" in ev["600005.SH"].reason
 
 
+def _industry_map_status(status: str, *, succeeded: int = 0, requested: int = 1) -> DatasetStatus:
+    return DatasetStatus(
+        dataset="industry_map", label="同花顺行业归属（行业指数成分反查）", endpoint="/api/a-share-index/catalog/ths-index-list + constituents",
+        status=status, requested=requested, succeeded=succeeded, failed=requested - succeeded,  # type: ignore[arg-type]
+        errors=["同花顺行业指数目录: code=5003 上游不可用 (request_id=rid-ind) 【演示故障注入】"],
+    )
+
+
+def test_rank_industry_missing_when_industry_map_failed():
+    base = _industry_snapshot()
+    no_industry = [make_stock(c, {"pe_ttm": v}) for c, v in (("600001.SH", 25.0), ("600002.SH", 250.0), ("600003.SH", 30.0))]
+    snap = make_snapshot(no_industry, reference=base.reference, reference_industry={}, datasets=[_industry_map_status("failed")])
+    out = evaluate(make_strategy(C("pe_ttm", "pct_rank_lte", 50, scope="industry")), snap)
+    for e in evals(out).values():
+        assert e.status == "missing"  # 接口失败造成的“无行业”是数据缺失，不是“不适用”
+        assert e.reason.startswith("行业归属数据获取失败：") and "code=5003" in e.reason and "rid-ind" in e.reason
+    st = stat(out, "c1")
+    assert (st.missing, st.not_applicable) == (3, 0)
+    assert codes(out.missing) == ["600001.SH", "600002.SH", "600003.SH"]
+    # 部分失败：未取得行业的股票同样按缺失处理，并说明是部分失败
+    partial = make_snapshot(_industry_snapshot().stocks, reference=base.reference, reference_industry=base.reference_industry,
+                            datasets=[_industry_map_status("partial", succeeded=80, requested=91)])
+    ev = evals(evaluate(make_strategy(C("pe_ttm", "pct_rank_lte", 50, scope="industry")), partial))
+    assert ev["600003.SH"].status == "missing"
+    assert ev["600003.SH"].reason.startswith("行业归属数据获取失败：部分失败（成功 80/91，错误样例 ") and "rid-ind" in ev["600003.SH"].reason
+    assert ev["600001.SH"].status == "pass"  # 已取得行业的股票照常判定
+    # 全A分位不依赖行业归属；行业映射正常时行业未知仍为“不适用”
+    market = evals(evaluate(make_strategy(C("pe_ttm", "pct_rank_lte", 50, scope="market")), snap))
+    assert all(e.status in ("pass", "fail") for e in market.values())
+    ok_map = evals(evaluate(make_strategy(C("pe_ttm", "pct_rank_lte", 50, scope="industry")),
+                            make_snapshot(no_industry, reference=base.reference, reference_industry={}, datasets=[_industry_map_status("ok", succeeded=1)])))
+    assert all(e.status == "not_applicable" and e.reason == "行业归属未知" for e in ok_map.values())
+
+
 def test_rank_market_group_and_missing_reference():
     out = evaluate(make_strategy(C("pe_ttm", "pct_rank_lte", 50, scope="market")), _industry_snapshot())
     ev = evals(out)
@@ -388,6 +440,32 @@ def test_data_coverage_conflict():
     assert "2/6" in c.message and "33%" in c.message and "主要原因" in c.message and c.suggestion
 
 
+def test_data_coverage_groups_reasons_ignoring_request_id_code_and_attempts():
+    def fail_reason(i: int) -> str:
+        attempts = "（共尝试 2 次）" if i % 2 else ""
+        return f"财务指标（本期）获取失败：code=5003 上游不可用 (request_id=rid-{i:04d})，Data source unavailable{attempts}"
+
+    stocks = [make_stock(f"6000{i:02d}.SH", {"roe": error("roe", fail_reason(i))}) for i in range(1, 7)]
+    stocks += [make_stock(f"0000{i:02d}.SZ", {"roe": missing("roe", f"数据未就绪，No adjustment events for thscode=0000{i:02d}.SZ")})
+               for i in range(1, 4)]
+    stocks += [make_stock("600099.SH", {"roe": 8.0})]
+    out = evaluate(make_strategy(C("roe", "gt", 5)), make_snapshot(stocks))
+    msg = out.conflicts[0].message
+    assert "9/10" in msg
+    # 6 只同一错误码与类别合并计数（逐股 request_id、重试次数不同），样例保留其中一个 request_id
+    assert "code=5003 上游不可用" in msg and "（6 只，request_id 为其中一例）" in msg
+    assert msg.count("request_id=rid-") == 1
+    # 只有代码不同的原因也合并
+    only_codes = [make_stock(f"0000{i:02d}.SZ", {"roe": missing("roe", f"No adjustment events for thscode=0000{i:02d}.SZ")}) for i in range(1, 4)]
+    msg2 = evaluate(make_strategy(C("roe", "gt", 5)), make_snapshot(only_codes)).conflicts[0].message
+    assert "（3 只）" in msg2
+    # 无 request_id 的占位“--”（如演示故障注入）不声称“request_id 为其中一例”
+    sim = [make_stock(f"60000{i}.SH", {"roe": error("roe", "财务指标（本期）获取失败：code=5003 上游不可用 (request_id=--) 【演示故障注入】")})
+           for i in range(1, 4)]
+    msg3 = evaluate(make_strategy(C("roe", "gt", 5)), make_snapshot(sim)).conflicts[0].message
+    assert "（3 只）" in msg3 and "request_id 为其中一例" not in msg3
+
+
 # ───────────────────────────── 确定性 ─────────────────────────────
 
 
@@ -473,7 +551,50 @@ def test_prefiltered_evaluation_stats_and_funnel():
     assert cheap.drop_effect is None and "预筛模式" in cheap.note
     deep_stat = stat(out, "c1")
     assert deep_stat.drop_effect == 2 and deep_stat.skipped == 3
+    assert "3 只股票未评估" in deep_stat.note
     assert out.conflicts == []  # 覆盖率按已取数的股票计算，skipped 不算缺失
+
+
+def test_prefiltered_skip_reason_distinguishes_failed_and_missing_cheap_conditions():
+    stocks = [
+        make_stock("600001.SH", {"pe_ttm": 8.0, "is_st": False, "roe": 12.0, "dividend_yield_ttm": 2.0}),  # 通过预筛，已深度取数
+        make_stock("600002.SH", {"pe_ttm": 25.0, "is_st": False}),  # 前置条件未通过
+        make_stock("600003.SH", {"pe_ttm": None, "is_st": False}),  # 前置条件数据缺失
+        make_stock("600004.SH", {"pe_ttm": 30.0, "is_st": None}),  # 既有未通过又有缺失 → 按“被排除”
+        make_stock("600005.SH", {"pe_ttm": not_applicable("pe_ttm"), "is_st": False}),  # 前置条件不适用
+        make_stock("600006.SH", {"pe_ttm": 40.0, "is_st": True}),  # 两条前置条件都未通过
+    ]
+    s = make_strategy(C("pe_ttm", "between", 0, 10), C("is_st", "is_false"), C("roe", "gte", 10),
+                      C("dividend_yield_ttm", "gte", 1, hard=False))
+    out = evaluate(s, make_snapshot(stocks, prefiltered=True))
+    pe_label, st_label = stat(out, "c1").label, stat(out, "c2").label
+    for cid in ("c3", "c4"):  # 深度硬条件与软条件的原因一致
+        ev = evals(out, cid)
+        assert ev["600001.SH"].status == "pass"
+        assert ev["600002.SH"].status == "skipped"
+        assert ev["600002.SH"].reason == f"已被前置条件排除（未通过：「{pe_label}」），未取数"
+        assert ev["600003.SH"].reason == f"前置条件数据缺失（「{pe_label}」），未进入深度评估"
+        assert ev["600004.SH"].reason == f"已被前置条件排除（未通过：「{pe_label}」），未取数"
+        assert ev["600005.SH"].reason == f"前置条件数据缺失或不适用（「{pe_label}」），未进入深度评估"
+        assert ev["600006.SH"].reason == f"已被前置条件排除（未通过：「{pe_label}」、「{st_label}」），未取数"
+    assert codes(out.included) == ["600001.SH"]
+    assert codes(out.excluded) == ["600002.SH", "600004.SH", "600006.SH"]
+    assert codes(out.missing) == ["600003.SH", "600005.SH"]
+    deep = stat(out, "c3")
+    assert deep.skipped == 5 and "该条件对 5 只股票未评估" in deep.note
+    # 深度条件对全部股票都未评估时，统计说明写明“全部”
+    all_skipped = evaluate(make_strategy(C("pe_ttm", "between", 0, 10), C("roe", "gte", 10)),
+                           make_snapshot([make_stock("600002.SH", {"pe_ttm": 25.0}), make_stock("600003.SH", {"pe_ttm": None})], prefiltered=True))
+    note = stat(all_skipped, "c2").note
+    assert "全部 2 只股票未评估" in note and stat(all_skipped, "c2").passed == stat(all_skipped, "c2").failed == 0
+    # 未通过的前置条件较多时只列前 3 条
+    many = evaluate(make_strategy(C("pe_ttm", "between", 0, 10), C("pb_mrq", "lt", 1), C("ps_ttm", "lt", 1), C("is_st", "is_false"), C("roe", "gte", 10)),
+                    make_snapshot([make_stock("600002.SH", {"pe_ttm": 30.0, "pb_mrq": 5.0, "ps_ttm": 5.0, "is_st": True})], prefiltered=True))
+    labels = [stat(many, f"c{k}").label for k in (1, 2, 3)]
+    assert evals(many, "c5")["600002.SH"].reason == f"已被前置条件排除（未通过：「{labels[0]}」、「{labels[1]}」、「{labels[2]}」 等 4 条），未取数"
+    # 非预筛快照不受影响
+    plain = evaluate(make_strategy(C("pe_ttm", "between", 0, 10), C("roe", "gte", 10)), make_snapshot([make_stock("600002.SH", {"pe_ttm": 25.0})]))
+    assert evals(plain, "c2")["600002.SH"].reason == "未获取该指标" and stat(plain, "c2").note is None
 
 
 # ───────────────────────────── 性能 ─────────────────────────────

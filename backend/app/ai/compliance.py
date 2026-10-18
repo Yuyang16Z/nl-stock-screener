@@ -1,7 +1,10 @@
 """输入/输出合规守卫（DESIGN §6.5）。全部为纯函数。
 
-- check_input：识别涨跌预测、荐股/买卖建议、收益承诺三类请求（block），以及“反弹/黑马”等弱预测措辞（warn）；
+- check_input：识别涨跌预测、荐股/买卖建议、收益承诺三类请求（block），以及“反弹/黑马”等弱预测措辞、
+  “有望走强/即将突破”等前瞻措辞、未与涨跌搭配的未来时间词（warn）；
+- history_warning：warn 中的前瞻措辞/未来时间词 → 解析 warnings 里的“已按历史走势描述处理，不代表未来”说明；
 - convertible_intent：把“会涨的股票/有潜力的股票”这类说法改写为只描述历史数据的句子，供规则解析生成草案；
+  含未来时间词或“翻倍/涨停/大涨”的说法不改写（只拦截）；
 - sanitize_output：删除模型输出中含买卖建议、目标价、收益承诺、涨跌预测的句子，并返回命中的禁语。
 """
 
@@ -28,14 +31,19 @@ _CLAUSE_STOP = "，,。；;！!？?\n"
 
 # ───────────────────────────── 输入侧 ─────────────────────────────
 
-# 指向未来的时间词（“近期/最近/今年”描述的是历史或当期，不在此列）
-_FUTURE = r"(?:明天|明日|后天|下周|下星期|下礼拜|下个?月|下半年|明年|接下来|未来|今后|往后|短期内|年底前?|月底前?|节后|下一?个?交易日)"
+# 指向未来的时间词（“近期/最近/今年”描述的是历史或当期，不在此列；“汽车后市场”不是“后市”）
+_FUTURE = (
+    r"(?:明天|明日|后天|下周|下星期|下礼拜|下个?月|下半年|明年|接下来|未来|今后|往后|后市(?!场)|短期内|年底前?|月底前?|节后|"
+    r"下一?个?交易日)"
+)
+_FUTURE_RE = re.compile(_FUTURE)
 # 价格/收益类走势词：与时间词搭配即为时间限定的涨跌预测（“涨”覆盖涨停、大涨）
-_MOVE = r"(?:涨|跌|走势|行情|股价|表现|反弹|收益|赚|翻倍|翻番)"
+_MOVE = r"(?:涨|跌|走势|行情|股价|表现|反弹|收益|赚|翻倍|翻番|走强|走弱|回升|上行|下行|突破|看好)"
 # 业绩类词：与时间词搭配时，还要有情态词（会/将/能/要……）才算预测（“未来业绩会增长吗” vs “接下来看业绩增长快的”）
 _FUNDAMENTAL = r"(?:业绩|盈利|利润|营收)"
 _MODAL = r"(?:会不会|能不能|可不可以|还会|还能|将要|将会|能够|可能|会|将|能|要)"
-_UP_MOVE = r"(?:上涨|暴涨|大涨|拉升|涨停|走强|涨)"
+# 输入侧识别用（含翻倍/翻番：“能翻倍”既是预测也是收益承诺）；改写只用 _REWRITE_UP，不含翻倍/涨停/大涨
+_UP_MOVE = r"(?:上涨|暴涨|大涨|拉升|涨停|走强|翻倍|翻番|涨)"
 _DOWN_MOVE = r"(?:下跌|暴跌|大跌|跌停|走弱|跌)"
 _NC = f"[^{_CLAUSE_STOP}]"  # 同一分句内的任意字符
 
@@ -51,6 +59,8 @@ _FIRM_PREDICTION: list[re.Pattern[str]] = [
     re.compile(rf"{_FUTURE}(?={_NC}{{0,8}}?{_MOVE})"),
     # “明年业绩会……”“下半年会不会盈利……”：时间词 + 业绩词 + 情态词
     re.compile(rf"{_FUTURE}(?={_NC}{{0,8}}?(?:{_MODAL}{_NC}{{0,6}}?{_FUNDAMENTAL}|{_FUNDAMENTAL}{_NC}{{0,4}}?{_MODAL}))"),
+    # “未来业绩增长快”“明年盈利改善”：对未来基本面的判断，同样只拦截、不改写成历史条件
+    re.compile(rf"{_FUTURE}(?={_NC}{{0,8}}?{_FUNDAMENTAL}{_NC}{{0,4}}?(?:增长|增速|提升|改善|向好|好转|高增|下滑|下降|恶化))"),
     re.compile(r"(?:涨到|能到|会到)\s*(?:多少|\d)|跌到多少|(?:能|会)突破\s*\d"),
     re.compile(r"目标价|目标位|目标股价"),
     # “预测市盈率/一致预期 EPS”是指标名（无一致预期数据，由解析放入 unsupported），不按预测请求拦截
@@ -58,7 +68,8 @@ _FIRM_PREDICTION: list[re.Pattern[str]] = [
 ]
 _PREDICTION: list[re.Pattern[str]] = [
     *_FIRM_PREDICTION,
-    re.compile(rf"{_MODAL}(?:大|继续|持续|再|一直)?(?:反弹|{_UP_MOVE}|{_DOWN_MOVE})"),
+    # “会涨/能翻倍/还会跌”（“有机会/动能/主要”里的“会/能/要”不是情态词）
+    re.compile(rf"(?<![机动主]){_MODAL}(?:大|继续|持续|再|一直)?(?:反弹|{_UP_MOVE}|{_DOWN_MOVE})"),
     re.compile(r"(?:走势|股价|行情|价格)(?:会|将|能)"),
     re.compile(r"有潜力|潜力股|潜力大|潜力足|成长潜力|增长潜力|上涨潜力|上涨空间|升值空间"),
 ]
@@ -86,12 +97,14 @@ _RETURN_PROMISE: list[re.Pattern[str]] = [
 
 # 弱预测措辞：不拦截，只提示（解析照常进行）
 _WARN: list[re.Pattern[str]] = [re.compile(r"反弹|黑马|牛股|妖股|起飞|主升浪|拉升|飙升")]
-# 前瞻措辞（与输出侧禁语“有望走强”同口径）：warn，并按历史走势描述处理
+# 前瞻措辞（与输出侧禁语“有望走强”同口径）：至少 warn，并按历史走势描述处理（“翻倍”另按收益承诺拦截）
 _FORWARD: list[re.Pattern[str]] = [
     re.compile(r"(?:有望|即将|大概率|有机会|可望)\s*(?:继续|持续|再度|再次)?\s*(?:上涨|反弹|走强|突破|大涨|涨停|翻倍|回升|上行)"),
+    # “看涨/看多”（输出侧禁语）；“看看涨幅”“查看涨跌幅”“看多少只”不算
+    re.compile(r"(?<![看查])看(?:涨|跌|多|空)(?![幅跌涨少间])|唱多|唱空"),
 ]
 # 未与涨跌/业绩情态搭配的未来时间词（“未来三年业绩增长快”）：warn，按历史数据处理
-_FUTURE_WARN: list[re.Pattern[str]] = [re.compile(_FUTURE)]
+_FUTURE_WARN: list[re.Pattern[str]] = [_FUTURE_RE]
 
 _HISTORY_HINT = re.compile(r"近|过去|去年|前年|已经|已|历史|曾经|曾|累计|涨幅|期间|以来")
 
@@ -110,10 +123,8 @@ _SUGGESTION = "可以改为描述可观察的数据特征，例如“近60日涨
 _WARN_MESSAGE = "“反弹、黑马”等说法涉及对未来走势的判断：本产品只按历史与当期数据筛选，不预测涨跌，结果不代表未来表现。"
 _FORWARD_MESSAGE = "“有望走强、即将突破”等说法是对未来走势的判断：本产品不预测涨跌，只能按历史走势描述筛选（如近60日涨跌幅），结果不代表未来表现。"
 _FUTURE_MESSAGE = "“未来、下半年”等时间词指向未来：本产品只按历史与当期数据筛选，相关说法按最新报告期/历史区间的数据处理，结果不代表未来表现。"
-_HISTORY_WARNINGS: dict[str, str] = {
-    _FORWARD_MESSAGE: "“{words}”涉及对未来走势的判断，已按历史走势描述处理，不代表未来表现。",
-    _FUTURE_MESSAGE: "“{words}”是对未来的表述，已按历史数据描述处理，不代表未来表现。",
-}
+_FORWARD_HINT = "“{words}”涉及对未来走势的判断，已按历史走势描述处理，不代表未来表现。"
+_FUTURE_HINT = "“{words}”是对未来的表述，已按历史数据描述处理，不代表未来表现。"
 
 
 def _clause_prefix(text: str, start: int, width: int = 8) -> str:
@@ -152,8 +163,9 @@ def _ordered_unique(hits: Sequence[tuple[int, str]]) -> list[str]:
 
 
 def check_input(text: str) -> ComplianceNotice | None:
-    """输入合规检查：预测/荐股/收益承诺 → block；弱预测措辞 → warn；其余 None。
+    """输入合规检查：预测/荐股/收益承诺 → block；弱预测措辞、前瞻措辞（有望走强）、单独的未来时间词 → warn；其余 None。
 
+    句首口语过渡词（“接下来看……”）不算时间限定；时间词与业绩/盈利搭配时须有情态词（会/将/能/要）才算预测。
     matched 为原文中的触发片段（按出现顺序去重），前端用于高亮。
     """
     t = _mask_transition(text or "")
@@ -170,12 +182,21 @@ def check_input(text: str) -> ComplianceNotice | None:
     return None
 
 
+def _outer_words(words: Sequence[str]) -> list[str]:
+    """去掉被其他命中片段包含的片段（“有望反弹”“反弹” → “有望反弹”），保持顺序。"""
+    return [w for w in words if not any(w != o and w in o for o in words)]
+
+
 def history_warning(notice: ComplianceNotice | None) -> str | None:
-    """前瞻措辞/未来时间词的 warn 提示 → 写进解析 warnings 的说明（“已按历史走势描述处理，不代表未来”）；其余 None。"""
+    """warn 提示中的前瞻措辞/未来时间词 → 写进解析 warnings 的说明（“已按历史走势描述处理，不代表未来”）；其余 None。"""
     if notice is None or notice.level != "warn":
         return None
-    tpl = _HISTORY_WARNINGS.get(notice.message)
-    return tpl.format(words="、".join(notice.matched) or "相关说法") if tpl else None
+    forward = [w for w in notice.matched if any(p.search(w) for p in _FORWARD)]
+    future = [w for w in notice.matched if _FUTURE_RE.search(w) and w not in forward]
+    words = _outer_words(forward + future)
+    if not words:
+        return None
+    return (_FORWARD_HINT if forward else _FUTURE_HINT).format(words="、".join(words))
 
 
 # ───────────────────────────── 可转化意图 ─────────────────────────────
@@ -183,21 +204,25 @@ def history_warning(notice: ComplianceNotice | None) -> str | None:
 UP_TREND_DESCRIPTION = "近60日趋势向上（仅描述历史，不代表未来）"
 _GROWTH_DESCRIPTION = "高成长（按最新报告期的历史增速）"
 
-# 改写：把对未来的期望换成可观察的历史描述（“翻倍/涨停/大涨”不改写，见 _NO_REWRITE）
+# 改写：把对未来的期望换成可观察的历史描述（“翻倍/涨停/大涨”不改写，含这些词的句子由 _NO_REWRITE 直接拦截）
 _REWRITE_UP = r"(?:上涨|拉升|走强|涨)"
 _REWRITES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"(?:成长|增长)潜力(?:大|足|高)?的?"), f"{_GROWTH_DESCRIPTION}的"),
     (re.compile(r"潜力股"), f"{UP_TREND_DESCRIPTION}的股票"),
     (re.compile(r"(?:有|具有|具备)?(?:上涨)?潜力(?:大|足)?的?|(?:有)?(?:上涨|升值)空间(?:大)?的?"), f"{UP_TREND_DESCRIPTION}的"),
-    (re.compile(rf"(?:还会|还能|将要|将会|能够|可能|会|将|能|要)(?:继续|持续|再|一直)?{_REWRITE_UP}的?"), f"{UP_TREND_DESCRIPTION}的"),
+    (re.compile(rf"(?:大概率|很可能|有望|即将|有机会|可望)\s*(?:继续|持续|再度|再次)?\s*(?:{_REWRITE_UP}|上行|回升)的?"),
+     f"{UP_TREND_DESCRIPTION}的"),
+    (re.compile(rf"(?<![机动主])(?:还会|还能|将要|将会|能够|可能|会|将|能|要)(?:继续|持续|再|一直)?{_REWRITE_UP}的?"), f"{UP_TREND_DESCRIPTION}的"),
 ]
-# 含未来时间词或“翻倍/涨停/大涨”的预测：只拦截，不给可执行草案（“下周能翻倍”不能改写成“近60日趋势向上”）
+# 含未来时间词（含句首的“接下来”）或“翻倍/翻番/涨停/大涨”的说法：只拦截，不给可执行草案
+# （“下周能翻倍”“明年能翻倍”不能改写成“近60日趋势向上”；历史语境的“近一年涨幅翻倍”也不改写）
 _NO_REWRITE: list[re.Pattern[str]] = [
     re.compile(rf"{_FUTURE}|今年内|今年之内"),
     re.compile(r"翻倍|翻番|涨停|大涨|暴涨"),
 ]
-# 删除：荐股、买卖动作与收益承诺的措辞（剩余部分若仍有可筛选的描述，则交给规则解析）
+# 删除：荐股、买卖动作与收益承诺的措辞、前瞻副词（剩余部分若仍有可筛选的描述，则交给规则解析）
 _REMOVALS: list[re.Pattern[str]] = [
+    re.compile(r"大概率|很可能|极可能|有望|即将|有机会|可望"),
     re.compile(r"(?:强烈)?推荐(?:一下|几只|几个|一些|一只|个|只|点)?(?:买入|买进|购买|买)?|荐股"),
     re.compile(
         r"(?:该不该|要不要|能不能|可不可以|值不值得|适不适合|应不应该|是否应该|是否|应该|该|要|能|可以|值得|适合)\s*"
@@ -228,15 +253,15 @@ def _tidy(text: str) -> str:
 def convertible_intent(text: str) -> str | None:
     """能转化为可观察条件的意图 → 改写后的句子（供规则解析）；无法转化 → None。
 
-    时间限定的涨跌预测（“明天会涨”“下周能翻倍”）、含未来时间词或“翻倍/翻番/涨停/大涨”的说法、目标价、
-    “预测股价”、看跌预测等不做转化（返回 None，只拦截）。
+    时间限定的涨跌预测（“明天会涨”“下周能翻倍”）、含未来时间词（明天/下周/明年/今年内/未来/接下来/后市……）
+    或“翻倍/翻番/涨停/大涨”的说法、目标价、“预测股价”、看跌预测等不做转化（返回 None，只拦截）。
     """
     t = (text or "").strip()
-    m = _TRANSITION.match(t)
-    if m is not None:  # 句首口语过渡词不算时间限定，也不留在改写句里
-        t = t[m.end():].strip()
-    if not t or _scan(t, _FIRM_PREDICTION) or _scan(t, _NO_REWRITE):
+    if not t or _scan(t, _FIRM_PREDICTION) or any(p.search(t) for p in _NO_REWRITE):
         return None
+    m = _TRANSITION.match(t)
+    if m is not None:  # 句首口语过渡词（“然后帮我找……”）不留在改写句里
+        t = t[m.end():].strip()
     out = t
     for pat, repl in _REWRITES:
         out = pat.sub(repl, out)
@@ -245,7 +270,9 @@ def convertible_intent(text: str) -> str | None:
     out = _tidy(out)
     if not out or out == t:
         return None
-    notice = check_input(out)
+    # 复查用户原有的其余措辞；插入的历史描述本身含“不代表未来”，不参与复查
+    probe = out.replace(UP_TREND_DESCRIPTION, "，").replace(_GROWTH_DESCRIPTION, "，")
+    notice = check_input(probe)
     if notice is not None and notice.level == "block":
         return None
     if len(_FILLER.sub("", out)) < 2:

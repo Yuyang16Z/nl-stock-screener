@@ -135,6 +135,15 @@ def failed(ds: str, *, code: int = 5003, kind: str = "upstream_unavailable", rid
     return Fetched(ds, error=FuyaoError("上游不可用", kind=kind, code=code, request_id=rid, endpoint=EP_IND, dataset=ds, params={"thscode": CODE}))  # type: ignore[arg-type]
 
 
+def no_dividend_events(*, rid: str = "rid-nodiv", simulated: bool = False) -> Fetched:
+    """扶摇对无除权除息事件的股票返回 code=3002 + "No adjustment events for thscode=..."（真实接口的报文格式）。"""
+    err = FuyaoError(
+        f"No adjustment events for thscode={CODE}", kind="not_ready", code=3002, request_id=rid,
+        endpoint=EP_DIV, dataset="dividends", params={"thscode": CODE, "from": "2025-09-12"}, simulated=simulated,
+    )
+    return Fetched("dividends", error=err)
+
+
 def geometric(n: int, step: float = 1.001, start: float = 100.0) -> list[float]:
     return [start * step**t for t in range(n)]
 
@@ -272,6 +281,79 @@ def test_suspended_stock_is_flagged_stale() -> None:
     assert mv.status == "ok"
     assert mv.stale is True
     assert "可能停牌" in (mv.evidence.note or "")
+
+
+SUSPENDED_ON = date(2026, 9, 14)  # 周一
+SUSPENDED_WHY = "该股最近交易日为 2026-09-14，早于市场最近交易日 2026-10-16（可能停牌）"
+SUSPENSION_MIDS = ["pe_ttm", "pb_mrq", "ps_ttm", "pcf_ttm", "pct_change_today", "market_cap_est", "dividend_yield_ttm"]
+
+
+def test_suspended_stock_valuation_snapshot_and_derived_metrics_are_stale() -> None:
+    stock = full_stock(history=history(geometric(300), end=SUSPENDED_ON))
+    out = run(stock, [*SUSPENSION_MIDS, "revenue_yoy", "return_20d"], trade_date=LAST_TRADE_DAY)
+    valuation_note = f"{SUSPENDED_WHY}，估值为停牌前数值"
+    for mid in ("pe_ttm", "pb_mrq", "ps_ttm", "pcf_ttm"):
+        mv = out[mid]
+        assert mv.status == "ok" and mv.stale is True, mid  # 值保留展示，stale 交给 evaluate 判为缺失
+        assert mv.evidence.note == valuation_note and mv.reason == valuation_note, mid
+        assert mv.evidence.as_of.date() == SUSPENDED_ON and mv.evidence.as_of.hour == 15, mid  # 时点为该股自身最近交易日
+        assert mv.evidence.period.startswith("该股最近交易日 2026-09-14 收盘（停牌前数值"), mid
+        assert "2026-10-16 收盘后快照" not in mv.evidence.period, mid
+    assert out["pe_ttm"].value == pytest.approx(15.5)
+    pct = out["pct_change_today"]
+    assert pct.stale is True and pct.reason == f"{SUSPENDED_WHY}，行情快照为停牌前数值"
+    mc = out["market_cap_est"]  # 派生指标：PE 法输入为停牌前估值
+    assert mc.status == "ok" and mc.stale is True and mc.reason == valuation_note
+    assert mc.evidence.note.startswith(valuation_note) and "估算值" in mc.evidence.note
+    assert mc.evidence.as_of.date() == SUSPENDED_ON
+    assert next(e for e in mc.evidence.inputs if e.metric == "pe_ttm").note == valuation_note
+    dy = out["dividend_yield_ttm"]  # 派生指标：最新价为停牌前价格
+    assert dy.status == "ok" and dy.stale is True and dy.reason == f"{SUSPENDED_WHY}，行情快照为停牌前数值"
+    assert out["return_20d"].stale is True  # 价格窗口沿用原口径
+    assert out["revenue_yoy"].stale is False  # 财务指标与停牌无关
+    # 市销率法回退同样传播
+    ps_path = run(full_stock(history=history(geometric(300), end=SUSPENDED_ON), valuations=valuations(pe_ttm=-3.0)), ["market_cap_est"], trade_date=LAST_TRADE_DAY)["market_cap_est"]
+    assert "市销率法" in (ps_path.evidence.period or "") and ps_path.stale is True and ps_path.reason == valuation_note
+
+
+def test_trading_stock_and_missing_history_are_not_marked_stale() -> None:
+    normal = run(full_stock(), SUSPENSION_MIDS, trade_date=LAST_TRADE_DAY)
+    assert all(mv.status == "ok" and mv.stale is False and mv.reason is None for mv in normal.values())
+    assert normal["pe_ttm"].evidence.period.startswith("最近交易日 2026-10-16 收盘后快照")
+    # 没取日K、日K失败：不判断（不能凭空认定停牌）
+    no_hist = StockRaw(info(), {k: v for k, v in full_stock().datasets.items() if k != "history"})
+    assert all(mv.stale is False for mv in run(no_hist, SUSPENSION_MIDS, trade_date=LAST_TRADE_DAY).values())
+    hist_failed = run(full_stock(history=failed("history")), SUSPENSION_MIDS, trade_date=LAST_TRADE_DAY)
+    assert all(mv.stale is False for mv in hist_failed.values())
+    # 市场最近交易日未知：同样不判断
+    assert run(full_stock(history=history(geometric(300), end=SUSPENDED_ON)), ["pe_ttm"])["pe_ttm"].stale is False
+
+
+def test_mark_suspended_matches_in_calc_marking() -> None:
+    suspended = full_stock(history=history(geometric(300), end=SUSPENDED_ON))
+    in_calc = run(suspended, [*SUSPENSION_MIDS, "return_20d", "roe"], trade_date=LAST_TRADE_DAY)
+    no_hist = StockRaw(info(), {k: v for k, v in suspended.datasets.items() if k != "history"})
+    plain = run(no_hist, [*SUSPENSION_MIDS, "roe"], trade_date=LAST_TRADE_DAY)
+    for mid in SUSPENSION_MIDS:
+        before = plain[mid].model_dump()
+        marked = F.mark_suspended(plain[mid], SUSPENDED_ON, LAST_TRADE_DAY)
+        assert plain[mid].model_dump() == before, mid  # 不修改入参
+        ref = in_calc[mid]
+        assert (marked.stale, marked.reason, marked.value) == (ref.stale, ref.reason, ref.value), mid
+        assert marked.evidence.note == ref.evidence.note and marked.evidence.as_of == ref.evidence.as_of, mid
+        if not ref.evidence.derived:
+            assert marked.evidence.period == ref.evidence.period, mid
+    # 非停牌敏感指标、非 ok、已标过期、未早于市场交易日：原样返回
+    assert F.mark_suspended(plain["roe"], SUSPENDED_ON, LAST_TRADE_DAY) is plain["roe"]
+    assert F.mark_suspended(in_calc["pe_ttm"], SUSPENDED_ON, LAST_TRADE_DAY) is in_calc["pe_ttm"]
+    assert F.mark_suspended(plain["pe_ttm"], LAST_TRADE_DAY, LAST_TRADE_DAY) is plain["pe_ttm"]
+    bad = run(full_stock(valuations=failed("valuations")), ["pe_ttm"])["pe_ttm"]
+    assert F.mark_suspended(bad, SUSPENDED_ON, LAST_TRADE_DAY) is bad
+    # 从已算出的指标反推该股最近交易日：价格窗口指标优先，其次是已标停牌的估值类指标
+    assert F.last_bar_from_metrics(in_calc) == SUSPENDED_ON
+    assert F.last_bar_from_metrics({"pe_ttm": in_calc["pe_ttm"]}) == SUSPENDED_ON
+    assert F.last_bar_from_metrics(plain) is None
+    assert F.last_bar_from_metrics(run(full_stock(), ["return_20d"])) == LAST_TRADE_DAY
 
 
 def test_zero_volume_or_turnover_bars_are_excluded() -> None:
@@ -481,6 +563,71 @@ def test_dividend_yield_ttm() -> None:
     assert no_price.status == "missing" and "最新价" in (no_price.reason or "")
 
 
+def test_no_dividend_events_3002_is_zero_dividend_not_missing() -> None:
+    mv = run(full_stock(dividends=no_dividend_events()), ["dividend_yield_ttm"])["dividend_yield_ttm"]
+    assert mv.status == "ok" and mv.value == 0.0 and mv.evidence.display == "0.00%"  # 对 ≥3% 判为不满足，而不是“数据缺失”
+    note = "数据源无分红事件记录（code=3002，request_id=rid-nodiv），按 0 处理"
+    div_ev = next(e for e in mv.evidence.inputs if e.metric == "dividend_per_share_ttm")
+    assert div_ev.value == 0.0 and div_ev.display == "0元/股" and div_ev.note == note
+    src = div_ev.sources[0]
+    assert (src.endpoint, src.request_id, src.field) == (EP_DIV, "rid-nodiv", "dividend_per_share")  # 来源可回溯
+    assert note in (mv.evidence.note or "")
+    assert any(s.request_id == "rid-nodiv" for s in mv.evidence.sources)
+    # 其他 3002（非“无事件”）、5xxx、演示故障注入：仍按缺失 / 错误处理，绝不当作 0
+    other = run(full_stock(dividends=failed("dividends", code=3002, kind="not_ready")), ["dividend_yield_ttm"])["dividend_yield_ttm"]
+    assert other.status == "missing" and "code=3002" in (other.reason or "")
+    upstream = run(full_stock(dividends=failed("dividends")), ["dividend_yield_ttm"])["dividend_yield_ttm"]
+    assert upstream.status == "error" and "code=5003" in (upstream.reason or "")
+    simulated = run(full_stock(dividends=no_dividend_events(simulated=True)), ["dividend_yield_ttm"])["dividend_yield_ttm"]
+    assert simulated.status == "missing"
+
+
+def test_market_cap_loss_making_stock_uses_pe_method() -> None:
+    loss_items = [
+        income_item(CODE, 2026, "Q2", 6.0e9, -1.2e9, report_date=date(2026, 8, 20)),
+        income_item(CODE, 2026, "Q1", 2.8e9, -0.5e9),
+        income_item(CODE, 2025, "Q4", 1.0e10, -2.0e9),
+        income_item(CODE, 2025, "Q3", 7.2e9, -1.4e9),
+        income_item(CODE, 2025, "Q2", 4.5e9, -0.9e9),
+        income_item(CODE, 2025, "Q1", 2.0e9, -0.4e9),
+    ]
+    # 归母净利润TTM = −12 − 20 + 9 = −23亿；PE −15.5（亏损）→ 市值 = −15.5 × −23亿 = 356.5亿（PE 法依然成立）
+    mc = run(full_stock(valuations=valuations(pe_ttm=-15.5), income=income(loss_items)), ["market_cap_est"])["market_cap_est"]
+    assert mc.status == "ok" and mc.value == pytest.approx(356.5)
+    assert mc.evidence.period == "估值快照 × 归母净利润TTM"
+    assert (mc.evidence.formula or "").startswith("pe_ttm × 归母净利润TTM") and "亏损股" in (mc.evidence.formula or "")
+    assert next(e for e in mc.evidence.inputs if e.metric == "parent_np_ttm").value == pytest.approx(-23.0)
+    # 异号（PE 为负、归母净利润TTM 为正）或 PE 为 0：退回市销率法（营收TTM 115亿 × PS 2.0）
+    for pe in (-15.5, 0.0):
+        alt = run(full_stock(valuations=valuations(pe_ttm=pe)), ["market_cap_est"])["market_cap_est"]
+        assert alt.value == pytest.approx(230.0), pe
+        assert "市销率法" in (alt.evidence.period or "") and "异号、为零或缺失" in (alt.evidence.formula or ""), pe
+    # PE 为正、归母净利润TTM 为负（异号）同样退回市销率法
+    mixed = run(full_stock(income=income(loss_items)), ["market_cap_est"])["market_cap_est"]
+    assert mixed.value == pytest.approx(230.0) and "市销率法" in (mixed.evidence.period or "")
+
+
+def test_indicator_5003_reason_says_period_may_be_undisclosed() -> None:
+    hint = "（该报告期尚未到法定披露截止日，可能尚未披露）"
+    assert F.INDICATOR_5003_HINT == hint
+    rep3 = make_report_period("2026-3", TODAY)  # 三季报截止日 10-31 未到
+    out = compute_stock_metrics(full_stock(indicators=failed("indicators", rid="rid-5003")), ["revenue_yoy", "roe_change"], rep3, TODAY)
+    reason = out["revenue_yoy"].reason or ""
+    assert out["revenue_yoy"].status == "error" and reason.endswith(hint)
+    assert "code=5003" in reason and "request_id=rid-5003" in reason  # 错误码与 request_id 仍保留
+    assert (out["roe_change"].reason or "").count(hint) == 1  # 只有本期失败（上年同期 2025-3 早已过截止日）
+    # 已过法定截止日的报告期（默认 2026 中报、上年同期）出现 5003：不能说“可能尚未披露”（审查回退项）
+    past = run(full_stock(indicators=failed("indicators", rid="rid-5003")), ["revenue_yoy"])["revenue_yoy"]
+    assert past.status == "error" and hint not in (past.reason or "")
+    yoy = run(full_stock(indicators_yoy=failed("indicators_yoy", rid="rid-y")), ["roe_change"])["roe_change"]
+    assert (yoy.reason or "").startswith("上年同期ROE：") and hint not in (yoy.reason or "")
+    # 演示故障注入、3002、其他数据集的 5003：不追加
+    injected = Fetched("indicators", error=fault_error("indicators", EP_IND, {"thscode": CODE}))
+    assert hint not in (run(full_stock(indicators=injected), ["revenue_yoy"])["revenue_yoy"].reason or "")
+    assert hint not in (run(full_stock(indicators=failed("indicators", code=3002, kind="not_ready")), ["revenue_yoy"])["revenue_yoy"].reason or "")
+    assert hint not in (run(full_stock(valuations=failed("valuations")), ["pe_ttm"])["pe_ttm"].reason or "")
+
+
 # ───────────────────────────── 估值 / 快照 / 代码表 ─────────────────────────────
 
 
@@ -600,3 +747,14 @@ def test_to_float_and_volatility_helpers() -> None:
     assert F.to_float("--") is None and F.to_float(None) is None and F.to_float(True) is None
     assert F.to_float("inf") is None
     assert calc_volatility([1.0, 1.0]) is None
+
+
+def test_snapshot_zero_volume_marks_valuation_stale_without_history() -> None:
+    """未取日K时用行情快照识别停牌（实测停牌股：last_price=None、volume=0），估值标为过期。"""
+    halted = full_stock(snapshot=snapshot(volume=0, turnover=0, last_price=None))
+    out = run(halted, ["pe_ttm"], trade_date=LAST_TRADE_DAY)
+    mv = out["pe_ttm"]
+    assert mv.stale is True
+    assert "无成交" in (mv.evidence.note or "") and "停牌前数值" in (mv.evidence.note or "")
+    normal = run(full_stock(), ["pe_ttm"], trade_date=LAST_TRADE_DAY)["pe_ttm"]
+    assert normal.stale is False

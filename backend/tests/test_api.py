@@ -10,10 +10,13 @@ import pytest
 
 from app import catalog
 from app.config import Settings
+from app.data.features import WINDOW_DAYS, Fetched, StockRaw, compute_stock_metrics
 from app.data.fuyao import FuyaoResponse
+from app.engine.conditions import normalize
 from app.main import create_app
-from app.schemas import DatasetStatus, FeatureSnapshot, ResolvedUniverse, UniverseOption
-from tests._fixtures_engine import _GENERATORS, error, synthetic_snapshot
+from app.schemas import Condition, DatasetStatus, FeatureSnapshot, ResolvedUniverse, StockInfo, Strategy, Universe, UniverseOption
+from app.services.runs import PRICE_POINTS, RunManager
+from tests._fixtures_engine import _GENERATORS, REPORT_PERIOD, error, synthetic_snapshot
 
 CN = timezone(timedelta(hours=8))
 N_STOCKS = 12
@@ -241,3 +244,81 @@ async def test_monitor_create_and_run(client: httpx.AsyncClient) -> None:
     assert entry["status"] == "done" and entry["diff"] is not None and entry["diff"]["base_run_id"] == run_id
     assert (await client.post("/api/monitors/nope/run")).status_code == 404
     assert (await client.delete(f"/api/monitors/{m['id']}")).status_code == 200
+
+
+def _weekdays(end: date, n: int) -> list[date]:
+    out: list[date] = []
+    d = end
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d)
+        d -= timedelta(days=1)
+    return list(reversed(out))
+
+
+async def test_stock_price_series_covers_drawdown_window_with_base_day(tmp_path) -> None:  # noqa: ANN001
+    """回撤/波动率用 250 日窗口 + 区间起点前一日共 251 根收盘价；详情页走势须含这 251 个点，前高可在图上复核。"""
+    days = _weekdays(date(2026, 10, 16), 300)
+    closes = [100.0] * 49 + [200.0] + [150.0 - 0.1 * k for k in range(250)]  # 前高恰在区间起点前一日（倒数第 251 根）
+    items = [
+        {"date_ms": int(datetime(d.year, d.month, d.day, tzinfo=CN).timestamp() * 1000), "close_price": c, "turnover": 1e8, "volume": 1e6}
+        for d, c in zip(days, closes)
+    ]
+    resp = FuyaoResponse(endpoint="/api/a-share/prices/historical", params={"thscode": "600001.SH"}, data={"item": items},
+                         request_id="req-long", fetched_at=datetime.now(CN), dataset="history")
+
+    class LongHistoryRepo(FakeRepo):
+        async def history(self, code, start, end, adjust="backward", *, faults=frozenset()):  # noqa: ANN001
+            return resp
+
+    mgr = RunManager(make_settings(tmp_path), LongHistoryRepo())
+    pts, src, note = await mgr._prices("600001.SH")
+    assert PRICE_POINTS == WINDOW_DAYS["max_drawdown_250d"] + 1 == 251
+    assert len(pts) == 251 and pts[-1].date == "2026-10-16"
+    assert note is not None and "含区间起点前一日收盘，便于复核回撤与收益" in note and "251" in note
+    assert src is not None and src.request_id == "req-long"
+    stock = StockRaw(info=StockInfo(thscode="600001.SH", ticker="600001"), datasets={"history": Fetched("history", response=resp)})
+    mv = compute_stock_metrics(stock, ["max_drawdown_250d"], REPORT_PERIOD, date(2026, 10, 17))["max_drawdown_250d"]
+    assert mv.status == "ok"
+    peak = next(e for e in mv.evidence.inputs if e.metric == "close_price（前高）")
+    assert peak.period == pts[0].date and peak.value == 200.0  # 证据里的前高就是图上的第一个点
+    chart = {p.date for p in pts}
+    assert all(e.period in chart for e in mv.evidence.inputs if e.metric.startswith("close_price"))
+
+
+def test_industry_map_failure_warning_lists_industry_rank_conditions() -> None:
+    s = normalize(Strategy(universe=Universe(), conditions=[
+        Condition(metric="pe_ttm", op="pct_rank_lte", value=50, rank_scope="industry"),
+        Condition(metric="pb_mrq", op="pct_rank_lte", value=50, rank_scope="market"),
+        Condition(metric="roe", op="gt", value=5, rank_scope="industry"),  # 非分位算子残留的 rank_scope 不受行业归属影响
+        Condition(metric="pcf_ttm", op="pct_rank_lte", value=60, rank_scope="industry", enabled=False),
+    ]))
+    label, endpoint = catalog.DATASETS["industry_map"]
+    snap = synthetic_snapshot(4, metrics=["pe_ttm"])
+    for status, succeeded in (("failed", 0), ("partial", 80)):
+        ds = DatasetStatus(dataset="industry_map", label=label, endpoint=endpoint, status=status, requested=91 if succeeded else 1,
+                           succeeded=succeeded, failed=11 if succeeded else 1, errors=["同花顺行业指数目录: code=5003 上游不可用 (request_id=--)"])
+        warnings = RunManager._warnings(s, snap.model_copy(update={"datasets": [ds]}), [])
+        w = next(x for x in warnings if x.startswith(label))
+        assert f"受影响条件：{s.conditions[0].label}；" in w, w
+        for c in s.conditions[1:]:
+            assert c.label not in w, (c.label, w)
+    # 行业映射正常时不提示
+    ok = DatasetStatus(dataset="industry_map", label=label, endpoint=endpoint, status="ok", requested=91, succeeded=91)
+    assert not any(x.startswith(label) for x in RunManager._warnings(s, snap.model_copy(update={"datasets": [ok]}), []))
+
+
+async def test_backtest_rejects_future_end_and_bad_benchmark() -> None:
+    from httpx import ASGITransport, AsyncClient
+
+    from app.data.periods import today_cn
+    from app.main import create_app
+
+    app = create_app()
+    today = today_cn()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        body = {"strategy": {"conditions": []}, "start": (today.replace(year=today.year - 2)).isoformat()}
+        r = await c.post("/api/backtest", json={**body, "end": f"{today.year + 3}-12-31"})
+        assert r.status_code == 400 and "结束日期不能晚于今天" in r.json()["detail"]
+        r = await c.post("/api/backtest", json={**body, "benchmark": "999999.XX"})
+        assert r.status_code == 400 and "基准指数代码" in r.json()["detail"]

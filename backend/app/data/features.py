@@ -4,7 +4,9 @@
 - 原始字段 null → missing（“接口返回空值（该期未披露或不适用）”）；字符串无法转数值 → missing；
 - 数据集请求失败 → error（原因含错误码与 request_id）；3001/3002 视为数据缺失（missing），3004 视为不适用；
   例外：分红送转 3002 "No adjustment events" = 该股无分红事件，近365天现金分红按 0 计（ok）；
+  财务指标 5003（非演示故障）的原因追加“该期可能尚未披露或数据源暂不可用”；
 - 该股自身日K最后一根早于市场最近交易日（停牌）→ 估值/快照及其派生指标 stale=True（evaluate 判为 missing）；
+  只在该股已取日K时判断（未取日K不判断）；增量补齐时由 repository 用 mark_suspended 按同一口径补标；
 - 金融企业的毛利率、流动比率为 null → not_applicable；market_cap_est 在 ps_ttm≤0 或营收TTM≤0 时 not_applicable；
 - 价格窗口样本 < 0.8×N → missing。缺失 / 失败 / 不适用绝不当作通过。
 """
@@ -15,7 +17,7 @@ import math
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 import numpy as np
@@ -24,7 +26,17 @@ from ..catalog import INDICATOR_FIELDS as CATALOG_INDICATOR_FIELDS
 from ..catalog import METRICS
 from ..schemas import Evidence, MetricStatus, MetricValue, ReportPeriod, SourceRef, StockFeatures, StockInfo
 from .fuyao import FuyaoError, FuyaoResponse, dataset_label, is_no_dividend_events
-from .periods import date_to_datetime, ms_to_date, ms_to_datetime, parse_date, parse_report, report_label, report_period_end
+from .periods import report_deadline
+from .periods import (
+    CN_TZ,
+    date_to_datetime,
+    ms_to_date,
+    ms_to_datetime,
+    parse_date,
+    parse_report,
+    report_label,
+    report_period_end,
+)
 
 # ───────────────────────────── 口径常量 ─────────────────────────────
 
@@ -38,7 +50,9 @@ FINANCIAL_INDUSTRY_KEYWORDS = ("银行", "证券", "保险", "多元金融")
 FINANCIAL_NAME_KEYWORDS = ("银行", "证券", "保险")  # 行业未知时按证券简称兜底判断
 NULL_REASON = "接口返回空值（该期未披露或不适用）"
 # 财务指标数据集返回 5003 时追加的提示（手动指定未到披露期的报告期时常见，避免被理解成单纯的供应商故障）
-INDICATOR_5003_HINT = "（该期可能尚未披露或数据源暂不可用）"
+INDICATOR_5003_HINT = "（该报告期尚未到法定披露截止日，可能尚未披露）"
+# 分红送转 3002 "No adjustment events"（该股无除权除息事件）按 0 处理时的证据说明前缀
+NO_DIVIDEND_EVENTS_NOTE = "数据源无分红事件记录"
 
 # 财务指标 index_id 以真实接口为准（成长类带 calculate_ 前缀，净利润同比为归母口径），见 docs/DATA_SOURCES.md §3
 INDICATOR_FIELDS: dict[str, str] = dict(CATALOG_INDICATOR_FIELDS)
@@ -60,6 +74,9 @@ REFERENCE_FIELDS: dict[str, tuple[str, str]] = {
     **{m: ("snapshot", f) for m, f in SNAPSHOT_FIELDS.items()},
 }
 FINANCIAL_NA_METRICS = frozenset({"gross_margin", "current_ratio"})
+# 停牌（该股最近有效日K早于市场最近交易日）时须标 stale 的指标：估值/行情快照直取字段及其派生的估算市值、股息率
+SUSPENSION_METRICS: frozenset[str] = frozenset({*VALUATION_FIELDS, *SNAPSHOT_FIELDS, "market_cap_est", "dividend_yield_ttm"})
+_SNAPSHOT_BASED = frozenset({*SNAPSHOT_FIELDS, "dividend_yield_ttm"})  # 依赖行情快照（最新价/涨跌幅）的指标
 METRIC_NOTES: dict[str, str] = {
     "roe": "报告期累计值（未年化）",
     "roe_deducted": "报告期累计值（未年化）",
@@ -341,6 +358,16 @@ def latest_bar_date(fetched: Fetched | None) -> date | None:
         return None
     bars = fetched_bars(fetched)
     return bars[-1].day if bars else None
+
+
+def suspension_reason(last: date, trade_date: date) -> str:
+    """该股最近有效日K早于市场最近交易日时的统一说明（价格窗口与估值/快照共用）。"""
+    return f"该股最近交易日为 {last.isoformat()}，早于市场最近交易日 {trade_date.isoformat()}（可能停牌）"
+
+
+def _suspended_text(last: date, trade_date: date, *, snapshot: bool) -> str:
+    """估值/快照类指标的停牌说明：“…（可能停牌），估值为停牌前数值”；行情快照类写“行情快照为停牌前数值”。"""
+    return f"{suspension_reason(last, trade_date)}，{'行情快照' if snapshot else '估值'}为停牌前数值"
 
 
 def dividend_events(data: Any) -> list[DividendEvent]:
@@ -729,12 +756,20 @@ class _Calc:
         assert f is not None and f.response is not None
         resp = f.response
         t_api = _resp_time(resp)
-        own = self._own_stale()
+        last = self._own_last_if_suspended()
         stale_note: str | None = None
-        if own is not None:
+        snap_halt = self._snapshot_halted() if last is None and self.trade_date is not None else False
+        if snap_halt and self.trade_date is not None:
+            # 未取日K时，用行情快照识别停牌：最近交易日成交量为 0 / 无最新价
+            stale_note = (
+                f"最近交易日 {self.trade_date.isoformat()} 该股无成交（行情快照成交量为 0，可能停牌），"
+                f"{'行情快照' if ds == 'snapshot' else '估值'}为停牌前数值"
+            )
+            t = datetime.combine(self.trade_date, datetime.min.time(), tzinfo=t_api.tzinfo).replace(hour=15)
+            period = f"最近交易日 {self.trade_date.isoformat()}（该股当日无成交，可能停牌；接口返回时间 {t_api:%Y-%m-%d %H:%M}）"
+        elif last is not None and self.trade_date is not None:
             # 该股自身最后一根日K早于市场最近交易日（停牌）：快照数值停留在停牌前，时点按该股最近交易日标注
-            last, why = own
-            stale_note = f"{why}，{'估值' if ds == 'valuations' else '行情快照'}为停牌前数值"
+            stale_note = _suspended_text(last, self.trade_date, snapshot=ds == "snapshot")
             t = datetime.combine(last, datetime.min.time(), tzinfo=t_api.tzinfo).replace(hour=15)
             period = f"该股最近交易日 {last.isoformat()} 收盘（停牌前数值；快照接口返回时间 {t_api:%Y-%m-%d %H:%M}）"
         elif self.trade_date is not None:
@@ -754,18 +789,26 @@ class _Calc:
             inp.evidence.note = stale_note
         return inp
 
-    def _own_stale(self) -> tuple[date, str] | None:
-        """该股自身有效日K最后一根早于市场最近交易日 → (该股最近交易日, 说明)。
+    def _snapshot_halted(self) -> bool:
+        """行情快照显示最近交易日无成交（成交量 ≤ 0，或无最新价但有前收）→ 视为停牌。"""
+        f = self._fetched("snapshot")
+        row = f.row if f is not None and f.ok else None
+        if not row:
+            return False
+        vol = to_float(row.get("volume"))
+        last_price = to_float(row.get("last_price"))
+        return (vol is not None and vol <= 0) or (last_price is None and to_float(row.get("prev_price")) is not None)
+
+    def _own_last_if_suspended(self) -> date | None:
+        """该股自身有效日K最后一根早于市场最近交易日 → 该股最近交易日；否则 None。
 
         只在本股已取日K时判断（策略不需要日K就不判断）；日K失败或无有效K线时同样不判断。
         """
-        if "own_stale" not in self._cache:
-            out: tuple[date, str] | None = None
+        if "own_last" not in self._cache:
             last = latest_bar_date(self._fetched("history"))
-            if last is not None and self.trade_date is not None and last < self.trade_date:
-                out = (last, f"该股最近交易日为 {last.isoformat()}，早于市场最近交易日 {self.trade_date.isoformat()}（可能停牌）")
-            self._cache["own_stale"] = out
-        return self._cache["own_stale"]
+            suspended = last is not None and self.trade_date is not None and last < self.trade_date
+            self._cache["own_last"] = last if suspended else None
+        return self._cache["own_last"]
 
     def _ind_input(self, name: str, *, yoy: bool, label: str) -> _In:
         ds = "indicators_yoy" if yoy else "indicators"
@@ -776,7 +819,8 @@ class _Calc:
         if bad is not None:
             f0 = self._fetched(ds)
             err = f0.error if f0 is not None else None
-            if err is not None and err.code == 5003 and not err.simulated and bad.reason and INDICATOR_5003_HINT not in bad.reason:
+            if (err is not None and err.code == 5003 and not err.simulated and bad.reason and INDICATOR_5003_HINT not in bad.reason
+                    and self.as_of <= report_deadline(rep)):
                 bad.reason += INDICATOR_5003_HINT
             return bad
         f = self._fetched(ds)
@@ -996,7 +1040,7 @@ class _Calc:
             # 扶摇对无除权除息事件的股票返回 3002 "No adjustment events"：明确的“无事件”，按 0 处理（不是取数失败）
             err = fd.error
             assert err is not None
-            note = f"数据源无分红事件记录（code={err.code}, request_id={err.request_id or '--'}），按 0 处理"
+            note = f"{NO_DIVIDEND_EVENTS_NOTE}（code={err.code}，request_id={err.request_id or '--'}），按 0 处理"
             src = err.source(thscode=self.code).model_copy(update={"field": "dividend_per_share"})
             ev = Evidence(
                 metric="dividend_per_share_ttm",
@@ -1047,7 +1091,7 @@ class _Calc:
         price = self._row_input("snapshot", "last_price", "元", label="最新价")
         period = div.evidence.period
         note = "估算：以除权除息日统计近365天现金分红，送转不计入"
-        if div.status == "ok" and div.evidence.note and div.evidence.note.startswith("数据源无分红事件记录"):
+        if div.status == "ok" and div.evidence.note and div.evidence.note.startswith(NO_DIVIDEND_EVENTS_NOTE):
             note = f"{note}；{div.evidence.note}"
         bad = _worst([div, price])
         if bad is not None:
@@ -1113,7 +1157,7 @@ class _Calc:
 
     def _stale(self, last: date) -> tuple[bool, str | None]:
         if self.trade_date is not None and last < self.trade_date:
-            return True, f"该股最近交易日为 {last.isoformat()}，早于市场最近交易日 {self.trade_date.isoformat()}（可能停牌）"
+            return True, suspension_reason(last, self.trade_date)
         return False, None
 
     def _window_ok(
@@ -1297,6 +1341,51 @@ class _Calc:
             inputs=[date_ev],
         )
         return MetricValue(metric=mid, status="ok", value=v, evidence=ev)
+
+
+# ───────────────────────────── 停牌补标（增量补齐用） ─────────────────────────────
+
+_API_TIME_RE = re.compile(r"接口返回时间 [^）)；]+")
+
+
+def _cn_date(dt: datetime) -> date:
+    return (dt.astimezone(CN_TZ) if dt.tzinfo is not None else dt).date()
+
+
+def last_bar_from_metrics(metrics: Mapping[str, MetricValue]) -> date | None:
+    """从已算出的指标反推该股最近有效日K日期：价格窗口指标的 as_of 即该股最近交易日；
+    其次是已按停牌标记的估值/快照类指标（as_of 为该股最近交易日收盘）。都没有则 None（不判断）。"""
+    for mid in WINDOW_DAYS:
+        mv = metrics.get(mid)
+        if mv is not None and mv.status == "ok" and mv.evidence is not None and mv.evidence.as_of is not None:
+            return _cn_date(mv.evidence.as_of)
+    for mid in sorted(SUSPENSION_METRICS):
+        mv = metrics.get(mid)
+        if mv is not None and mv.status == "ok" and mv.stale and mv.evidence is not None and mv.evidence.as_of is not None:
+            return _cn_date(mv.evidence.as_of)
+    return None
+
+
+def mark_suspended(mv: MetricValue, last: date, trade_date: date) -> MetricValue:
+    """该股最近交易日 last 早于市场最近交易日时，给估值/快照类指标补标过期（与单股计算同一说明与时点口径）。
+
+    用于估值/快照与日K在不同阶段取得的增量补齐（全A预筛后深度取数、what-if 补指标）；返回新对象，不修改入参。
+    非 SUSPENSION_METRICS、非 ok 或已标过期的指标原样返回。
+    """
+    if mv.metric not in SUSPENSION_METRICS or mv.status != "ok" or mv.stale or not last < trade_date:
+        return mv
+    note = _suspended_text(last, trade_date, snapshot=mv.metric in _SNAPSHOT_BASED)
+    ev = mv.evidence
+    if ev is not None:
+        update: dict[str, Any] = {
+            "note": f"{note}；{ev.note}" if ev.note else note,
+            "as_of": datetime.combine(last, time(15, 0), tzinfo=CN_TZ),
+        }
+        if not ev.derived:
+            m = _API_TIME_RE.search(ev.period or "")
+            update["period"] = f"该股最近交易日 {last.isoformat()} 收盘（停牌前数值" + (f"；快照{m.group(0)}）" if m else "）")
+        ev = ev.model_copy(update=update)
+    return mv.model_copy(update={"stale": True, "reason": note, "evidence": ev})
 
 
 # ───────────────────────────── 入口 ─────────────────────────────

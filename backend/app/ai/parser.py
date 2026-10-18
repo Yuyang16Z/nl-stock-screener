@@ -2,6 +2,8 @@
 
 LLM 只产出“候选条件草案”；所有条件必须通过 catalog 的指标/算子/分位口径校验，未通过的丢弃并写 warning。
 LLM 不可用、调用异常或输出结构不合法时，降级到规则词典解析（fallback.parse），parser="rule_fallback"。
+LLM 结果的确定性补充（与规则路径一致）：warn 级合规（“有望走强”等）在 warnings 写明已按历史描述处理；
+预测类指标（预测市盈率/一致预期）放入 unsupported，不用历史口径指标代替；修改句要删除/调整的类别不存在时写 warning。
 """
 
 from __future__ import annotations
@@ -156,6 +158,32 @@ def _blocked_by_ai(intent: str) -> ComplianceNotice:
     )
 
 
+def _forecast_spans(query: str) -> list[tuple[int, int, str]]:
+    """“预测市盈率/一致预期EPS”等预测类指标在原句中的位置（无一致预期数据，不能用历史口径指标代替）。"""
+    return [(m.start(), m.end(), m.group(0)) for m in fallback.FORECAST_METRIC.finditer(query) if m.end() > m.start()]
+
+
+def _overlaps_forecast(query: str, phrase: str | None, spans: Sequence[tuple[int, int, str]]) -> bool:
+    if not phrase or not spans:
+        return False
+    i = query.find(phrase)
+    return i >= 0 and any(i < e and s < i + len(phrase) for s, e, _ in spans)
+
+
+def _forecast_unsupported(spans: Sequence[tuple[int, int, str]], existing: Sequence[Unsupported]) -> list[Unsupported]:
+    """预测类指标 → unsupported（AI 已列出同一片段的不重复添加）。"""
+    out: list[Unsupported] = []
+    for _, _, word in spans:
+        if any(word in u.phrase or u.phrase in word for u in [*existing, *out]):
+            continue
+        out.append(Unsupported(phrase=word, reason=fallback.FORECAST_REASON, alternative=fallback.FORECAST_ALTERNATIVE))
+    return out
+
+
+def _forecast_dropped(phrase: str) -> str:
+    return f"“{phrase}”涉及预测/一致预期类指标，当前数据源未提供，已忽略 AI 给出的历史口径条件。"
+
+
 def _unsupported_items(raw: Any) -> list[Unsupported]:
     out: list[Unsupported] = []
     if not isinstance(raw, list):
@@ -248,6 +276,10 @@ async def _from_llm_screen(query: str, raw: Mapping[str, Any], searcher: Univers
     if not isinstance(phrases_raw, list):
         raise _InvalidOutput("phrases 不是数组")
     unsupported = _unsupported_items(raw.get("unsupported"))
+    # 预测类指标（预测市盈率、一致预期EPS）：没有一致预期数据 → unsupported；AI 若用历史口径指标代替，丢弃该短语
+    spans = _forecast_spans(query)
+    unsupported += _forecast_unsupported(spans, unsupported)
+    forecast_dropped = 0
 
     drafts: list[PhraseDraft] = []
     ref_map: dict[str, str] = {}
@@ -259,6 +291,10 @@ async def _from_llm_screen(query: str, raw: Mapping[str, Any], searcher: Univers
         phrase = (p.get("phrase") or "").strip() if isinstance(p.get("phrase"), str) else ""
         if not phrase:
             warnings.append(f"已忽略 AI 输出中第 {i} 个缺少原文片段的短语。")
+            continue
+        if _overlaps_forecast(query, phrase, spans):
+            warnings.append(_forecast_dropped(phrase))
+            forecast_dropped += 1
             continue
         meaning = _clean(p.get("meaning"), phrase) or phrase
         confidence = p.get("confidence") if p.get("confidence") in _CONFIDENCE else "medium"
@@ -302,7 +338,7 @@ async def _from_llm_screen(query: str, raw: Mapping[str, Any], searcher: Univers
             question=_clean(p.get("question")), options=options, default_option_id="a",
         ))
 
-    if phrases_raw and not drafts:
+    if phrases_raw and not drafts and not forecast_dropped:
         raise _InvalidOutput("AI 给出的条件均未通过指标目录校验" + (f"（{warnings[0]}）" if warnings else ""))
 
     ud = await _universe_draft(raw.get("universe"), query, searcher)
@@ -315,6 +351,7 @@ async def _from_llm_screen(query: str, raw: Mapping[str, Any], searcher: Univers
     strategy, interps, clars = assemble_screen(query, drafts, ud, origin="ai")
     if not drafts:
         warnings.append(fallback.NO_CONDITION_HINT)
+    warnings += fallback.guard_negative_caps(strategy, clars)
     conflicts = detect_conflicts(strategy)
     conflicts += _ai_conflicts(raw.get("conflicts"), ref_map, strategy, conflicts)
     return ParseResult(
@@ -420,8 +457,12 @@ async def _from_llm_modify(
             touched.append(after.id)
             conds[idx] = after
 
+    spans = _forecast_spans(query)
     for k, d in enumerate(patch.get("add") if isinstance(patch.get("add"), list) else [], 1):
         phrase = d.get("source_phrase") if isinstance(d, Mapping) and isinstance(d.get("source_phrase"), str) else query
+        if phrase != query and _overlaps_forecast(query, phrase, spans):
+            warnings.append(_forecast_dropped(phrase))
+            continue
         cond, why = _build_condition(d, source_phrase=phrase)
         if cond is None:
             spec = _spec_text(d) if isinstance(d, Mapping) else str(d)[:30]
@@ -439,6 +480,7 @@ async def _from_llm_modify(
     universe = base_n.universe.model_copy(deep=True)
     clars: list[Clarification] = []
     unsupported = _unsupported_items(raw.get("unsupported"))
+    unsupported += _forecast_unsupported(spans, unsupported)
     if isinstance(patch.get("universe"), Mapping):
         ud = await _universe_draft(patch.get("universe"), query, searcher)
         unsupported += ud.unsupported
@@ -455,6 +497,9 @@ async def _from_llm_modify(
     new = base_n.model_copy(deep=True)
     new.conditions, new.universe = conds, universe
     strategy = normalize(new)
+    # 修改句要删除/调整的类别在修改前后的策略里都没有 → 提示该部分未生效（与规则路径一致）
+    present = {c.metric for c in base_n.conditions} | {c.metric for c in strategy.conditions}
+    warnings += [w for w in fallback.missing_category_warnings(query, present) if w not in warnings]
     if not changes:
         warnings.append(fallback.NO_MODIFICATION_HINT)
     conflicts = detect_conflicts(strategy)
@@ -514,6 +559,11 @@ async def parse_query(req: ParseRequest, llm: LLMClient | None, searcher: Univer
 
     # 3) 严格校验与组装
     intent = raw.get("intent")
+    if intent == "prediction_request" and _forecast_spans(q):
+        # 合规前置已判定不是预测请求（否则不会走到这里）：“预测市盈率”是指标名，按规则解析放入 unsupported，不整句拦截
+        return await _rule_fallback(
+            q, base, searcher, "AI 把“预测市盈率/一致预期”等指标名当作预测请求；该类指标需要一致预期数据，已使用规则词典解析",
+        )
     try:
         if intent in ("prediction_request", "advice_request"):
             result = ParseResult(intent=intent, compliance=_blocked_by_ai(intent), warnings=[fallback.BLOCKED_HINT])
@@ -534,5 +584,9 @@ async def parse_query(req: ParseRequest, llm: LLMClient | None, searcher: Univer
     result.parser = "llm"
     result.llm_model = getattr(llm, "model", None) or get_settings().llm_model
     if notice is not None and result.compliance is None:
+        # warn 级（“有望走强”“未来三年”等）：解析照常进行，并在 warnings 中写明已按历史描述处理（与规则路径一致）
         result.compliance = notice
+        hint = compliance.history_warning(notice)
+        if hint and result.strategy is not None and hint not in result.warnings:
+            result.warnings = [hint, *result.warnings]
     return result

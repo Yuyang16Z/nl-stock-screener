@@ -41,7 +41,7 @@ _METRICS: list[MetricDef] = [
     _m(
         id="pe_ttm", name="市盈率TTM", category="valuation", unit="倍",
         description="股价相对最近12个月净利润的倍数，由数据源计算；亏损公司为负值。",
-        source=f"{FY} /api/a-share/valuations/snapshot · pe_ttm", datasets=["valuations"],
+        source=f"{FY} /api/a-share/valuations/snapshot · pe_ttm", datasets=["valuations", "snapshot"],
         period_type="realtime", higher_is_better=False, allowed_ops=NUMERIC_OPS + RANK_OPS,
         rank_scopes=["universe", "industry", "market"], positive_only_for_rank=True,
         plausible_range=(-5000, 5000), sweep_values=[10, 15, 20, 25, 30, 40, 50], backtestable=True,
@@ -51,7 +51,7 @@ _METRICS: list[MetricDef] = [
     _m(
         id="pb_mrq", name="市净率MRQ", category="valuation", unit="倍",
         description="股价相对最近一期每股净资产的倍数，由数据源计算；净资产为负时无常规意义。",
-        source=f"{FY} /api/a-share/valuations/snapshot · pb_mrq", datasets=["valuations"],
+        source=f"{FY} /api/a-share/valuations/snapshot · pb_mrq", datasets=["valuations", "snapshot"],
         period_type="realtime", higher_is_better=False, allowed_ops=NUMERIC_OPS + RANK_OPS,
         rank_scopes=["universe", "industry", "market"], positive_only_for_rank=True,
         plausible_range=(-500, 500), sweep_values=[0.8, 1, 1.5, 2, 3, 5],
@@ -60,7 +60,7 @@ _METRICS: list[MetricDef] = [
     _m(
         id="ps_ttm", name="市销率TTM", category="valuation", unit="倍",
         description="股价相对最近12个月营业收入的倍数，由数据源计算。",
-        source=f"{FY} /api/a-share/valuations/snapshot · ps_ttm", datasets=["valuations"],
+        source=f"{FY} /api/a-share/valuations/snapshot · ps_ttm", datasets=["valuations", "snapshot"],
         period_type="realtime", higher_is_better=False, allowed_ops=NUMERIC_OPS + RANK_OPS,
         rank_scopes=["universe", "industry", "market"], positive_only_for_rank=True,
         plausible_range=(0, 2000), sweep_values=[1, 2, 3, 5, 8, 12], aliases=["市销率", "PS"],
@@ -68,7 +68,7 @@ _METRICS: list[MetricDef] = [
     _m(
         id="pcf_ttm", name="市现率TTM", category="valuation", unit="倍",
         description="股价相对最近12个月经营现金流的倍数，由数据源计算；经营现金流为负时为负值。",
-        source=f"{FY} /api/a-share/valuations/snapshot · pcf_ttm", datasets=["valuations"],
+        source=f"{FY} /api/a-share/valuations/snapshot · pcf_ttm", datasets=["valuations", "snapshot"],
         period_type="realtime", higher_is_better=False, allowed_ops=NUMERIC_OPS + RANK_OPS,
         rank_scopes=["universe", "industry", "market"], positive_only_for_rank=True,
         plausible_range=(-5000, 5000), sweep_values=[5, 10, 15, 20, 30], aliases=["市现率", "PCF"],
@@ -276,7 +276,7 @@ _METRICS: list[MetricDef] = [
         id="market_cap_est", name="估算总市值", category="size", unit="亿元",
         description="数据源暂未提供总市值字段：优先按 市盈率TTM × 归母净利润TTM 估算；亏损（PE≤0）时改用 市销率TTM × 营业收入TTM。",
         formula="pe_ttm × 归母净利润TTM ÷ 1e8（PE≤0 时 ps_ttm × 营业收入TTM ÷ 1e8）；TTM = 本期累计 + 上年年报 − 上年同期累计",
-        source=f"派生：{FY} 估值快照 pe_ttm/ps_ttm + 利润表 parent_holder_net_profit/operating_income", datasets=["valuations", "income"],
+        source=f"派生：{FY} 估值快照 pe_ttm/ps_ttm + 利润表 parent_holder_net_profit/operating_income", datasets=["valuations", "income", "snapshot"],
         period_type="realtime", higher_is_better=None, allowed_ops=NUMERIC_OPS + RANK_OPS,
         rank_scopes=["universe"], plausible_range=(0, 300000), sweep_values=[50, 100, 200, 500, 1000, 3000],
         derived=True, estimate=True, caveats=["估算值，可能与实际总市值存在偏差"],

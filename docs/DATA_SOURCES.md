@@ -40,7 +40,7 @@
 |---|---|---|---|
 | 1 | 成长类 `index_id` 为 `operating_income_yoy_growth_ratio` / `net_profit_yoy_growth_ratio` / `operating_profit_yoy_growth_ratio` | 实际为 `calculate_operating_income_yoy_growth_ratio` / `calculate_parent_holder_net_profit_yoy_growth_ratio` / `calculate_operating_profit_yoy_growth_ratio`；另有 `fixed_asset_invest_expansion_ratio` | `catalog.INDICATOR_FIELDS` 以实测为准；“净利润同比”更名为“**归母**净利润同比增长率” |
 | 2 | 利润表 `report_date_ms` 为披露日 | 历史期的披露日会被后续报告覆盖：茅台 2025Q2 显示 2026-08-15、2024Q4 显示 2026-04-17（即包含该期比较数据的最新报告日期） | 回测判断“当时是否可得”改用法定披露截止日（一季报 4/30、中报 8/31、三季报 10/31、年报次年 4/30），不用 `report_date_ms` |
-| 3 | 未就绪数据返回 `3002` | 尚未披露的报告期（2026-3）返回 `5003 Data source unavailable` | 财务指标的 5003 只重试 1 次，原因写成“该期可能尚未披露或数据源不可用” |
+| 3 | 未就绪数据返回 `3002` | 尚未披露的报告期（2026-3）返回 `5003 Data source unavailable` | 财务指标的 5003 只重试 1 次；报告期尚未到法定披露截止日时，原因追加“该报告期尚未到法定披露截止日，可能尚未披露” |
 | 4 | — | 平安银行 2026Q1：加权 ROE 2.83%，扣非加权 ROE 9.15%（二者本应接近） | 扣非 ROE 不进默认解释；作为“数据冲突”样例写进测试说明 |
 
 ## 4. 派生指标复核（用实测原始数值手算）

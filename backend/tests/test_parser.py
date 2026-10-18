@@ -218,3 +218,102 @@ async def test_compliance_block_prediction() -> None:
 async def test_llm_reported_advice_intent() -> None:
     r = await parse_query(ParseRequest(query="帮我挑几只票"), FakeLLM({"intent": "advice_request", "phrases": []}), None)
     assert r.intent == "advice_request" and r.compliance.level == "block" and r.strategy is None
+
+
+async def test_time_limited_doubling_blocked_before_llm() -> None:
+    """#1：API 走的 parse_query 同样只拦截，不调用 LLM，也不返回可执行草案。"""
+    for q in ["帮我找下周能翻倍的票", "下周最可能翻倍的票", "明年能翻倍的股票"]:
+        llm = FakeLLM(_screen_output())
+        r = await parse_query(ParseRequest(query=q), llm, None)
+        assert r.intent == "prediction_request" and r.strategy is None, q
+        assert r.compliance is not None and r.compliance.level == "block"
+        assert not llm.calls
+
+
+def _forward_output() -> dict:
+    return {
+        "intent": "screen",
+        "universe": None,
+        "phrases": [
+            {"phrase": "有望走强", "meaning": "近期走势偏强（仅描述历史区间，不代表未来）", "confidence": "medium",
+             "conditions": [_c("return_60d", "gt", 0)], "alternatives": []},
+            {"phrase": "低估值", "meaning": "估值处于行业较低水平", "confidence": "medium",
+             "conditions": [_c("pe_ttm", "gt", 0), _c("pe_ttm", "pct_rank_lte", 30, "industry")], "alternatives": []},
+        ],
+        "unsupported": [], "conflicts": [], "patch": None,
+    }
+
+
+async def test_forward_phrase_warn_on_llm_and_rule_paths() -> None:
+    """#11：“有望走强”在 LLM 路径与规则降级路径都给 warn，并写明已按历史走势描述处理。"""
+    llm = FakeLLM(_forward_output())
+    r = await parse_query(ParseRequest(query="有望走强的低估值股"), llm, None)
+    assert r.parser == "llm" and llm.calls and r.intent == "screen" and r.strategy is not None
+    assert r.compliance is not None and r.compliance.level == "warn"
+    assert any("已按历史走势描述处理，不代表未来" in w for w in r.warnings)
+
+    r = await parse_query(ParseRequest(query="有望走强的低估值股"), None, None)
+    assert r.parser == "rule_fallback" and r.compliance is not None and r.compliance.level == "warn"
+    assert any("已按历史走势描述处理，不代表未来" in w for w in r.warnings)
+
+
+async def test_transition_word_reaches_llm() -> None:
+    """#12：“接下来看业绩增长快的公司”不被合规前置拦截，正常交给 LLM 解析。"""
+    out = {"intent": "screen", "universe": None, "phrases": [
+        {"phrase": "业绩增长快", "meaning": "最新报告期归母净利润同比增长", "confidence": "medium",
+         "conditions": [_c("net_profit_yoy", "gt", 20)], "alternatives": []},
+    ], "unsupported": [], "conflicts": [], "patch": None}
+    llm = FakeLLM(out)
+    r = await parse_query(ParseRequest(query="接下来看业绩增长快的公司"), llm, None)
+    assert llm.calls and r.parser == "llm" and r.intent == "screen"
+    assert r.compliance is None or r.compliance.level != "block"
+    assert any(c.metric == "net_profit_yoy" for c in r.strategy.conditions)
+
+
+async def test_forecast_metric_goes_to_unsupported() -> None:
+    """#12：“预测市盈率”不拦截；LLM 若用 pe_ttm 代替，丢弃该短语并放入 unsupported（无一致预期数据）。"""
+    out = {"intent": "screen", "universe": None, "phrases": [
+        {"phrase": "预测市盈率低", "meaning": "市盈率较低", "confidence": "medium",
+         "conditions": [_c("pe_ttm", "pct_rank_lte", 30, "industry")], "alternatives": []},
+    ], "unsupported": [], "conflicts": [], "patch": None}
+    llm = FakeLLM(out)
+    r = await parse_query(ParseRequest(query="预测市盈率低的股票"), llm, None)
+    assert llm.calls and r.parser == "llm" and r.intent != "prediction_request"
+    assert r.strategy is None or not any(c.metric == "pe_ttm" for c in r.strategy.conditions)
+    hit = [u for u in r.unsupported if "预测市盈率" in u.phrase]
+    assert hit and "一致预期" in hit[0].reason
+    assert any("预测/一致预期" in w for w in r.warnings)
+
+    r = await parse_query(ParseRequest(query="预测市盈率低的股票"), None, None)
+    assert r.parser == "rule_fallback" and r.intent != "prediction_request"
+    assert any("预测市盈率" in u.phrase and "一致预期" in u.reason for u in r.unsupported)
+
+    # LLM 把指标名误判为预测请求：不整句拦截，改用规则解析（unsupported 写明无一致预期数据）
+    llm = FakeLLM({"intent": "prediction_request", "phrases": []})
+    r = await parse_query(ParseRequest(query="预测市盈率低的股票"), llm, None)
+    assert llm.calls and r.parser == "rule_fallback" and r.intent != "prediction_request"
+    assert r.compliance is None and "一致预期" in (r.llm_error or "")
+    assert any("预测市盈率" in u.phrase and "一致预期" in u.reason for u in r.unsupported)
+    # 普通的预测请求仍按 AI 判断拦截
+    r = await parse_query(ParseRequest(query="帮我挑几只票"), FakeLLM({"intent": "prediction_request", "phrases": []}), None)
+    assert r.intent == "prediction_request" and r.compliance is not None and r.compliance.level == "block"
+
+
+async def test_modify_absent_category_warning_on_llm_path() -> None:
+    """#14：LLM 修改路径同样提示“当前策略中没有××条件，该部分未生效”。"""
+    base = (await fallback.parse(EXAMPLE)).strategy
+    rank = next(c for c in base.conditions if c.metric == "pe_ttm" and c.op == "pct_rank_lte")
+    vol = next(c for c in base.conditions if c.metric == "volatility_250d")
+    out = {"intent": "modify", "phrases": [], "patch": {"add": [], "remove": [], "update": [{"id": rank.id, "value": 70}], "universe": None}}
+    r = await parse_query(ParseRequest(query="估值放宽到行业70%分位，去掉回撤条件", base_strategy=base), FakeLLM(out), None)
+    assert r.parser == "llm" and any(c.startswith("放宽条件") for c in r.changes)
+    assert "当前策略中没有回撤条件，该部分未生效。" in r.warnings
+    assert any(c.id == vol.id for c in r.strategy.conditions)
+
+    # LLM 新增了该类条件：不提示
+    out = {"intent": "modify", "phrases": [], "patch": {
+        "add": [_c("dividend_yield_ttm", "gte", 3, source_phrase="股息率调到3%以上")], "remove": [], "update": [], "universe": None,
+    }}
+    r = await parse_query(ParseRequest(query="股息率调到3%以上", base_strategy=base), FakeLLM(out), None)
+    assert any(c.metric == "dividend_yield_ttm" for c in r.strategy.conditions)
+    assert not any("当前策略中没有" in w for w in r.warnings)

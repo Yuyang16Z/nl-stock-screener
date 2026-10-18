@@ -1,8 +1,9 @@
 """规则词典解析（DESIGN §6.3）：AI 不可用时的降级解析，主链路仍可跑通。
 
-匹配顺序：股票池关键词（UNIVERSE_LEXICON）→ 默认风控说法（剔除ST/次新）→ 规则词典（LEXICON，
-最长匹配优先、已匹配片段屏蔽）→ 暂不支持的说法（UNSUPPORTED_HINTS）→ “X行业/X板块/X概念”交给股票池检索。
-每个命中的词典条目都生成澄清问题（默认项 = 词典 default）。修改语句（放宽/收紧/去掉/只看）做有限支持。
+匹配顺序：股票池关键词（UNIVERSE_LEXICON）→ 默认风控说法（剔除ST/次新）→ 预测类指标（预测市盈率/一致预期，
+无一致预期数据 → unsupported）→ 规则词典（LEXICON，最长匹配优先、已匹配片段屏蔽）→ 暂不支持的说法（UNSUPPORTED_HINTS）
+→ “X行业/X板块/X概念”交给股票池检索。每个命中的词典条目都生成澄清问题（默认项 = 词典 default）。
+修改语句（放宽/收紧/去掉/只看）做有限支持；要删除/调整的类别在当前策略中不存在时写 warning（该部分未生效）。
 
 本模块同时提供 LLM 解析层复用的公共构件：股票池检索与澄清、默认风控条件、草案组装、变更说明。
 """
@@ -660,6 +661,7 @@ async def parse_rules(query: str, searcher: UniverseSearcher | None = None) -> P
     strategy, interps, clars = assemble_screen(q, phrases, ud, origin="rule", extra_interpretations=risk)
     if not phrases:
         warnings.append(NO_CONDITION_HINT)
+    warnings += guard_negative_caps(strategy, clars)
     return ParseResult(
         intent="screen", strategy=strategy, interpretations=interps, clarifications=clars,
         conflicts=detect_conflicts(strategy), unsupported=unsupported, parser="rule_fallback", warnings=warnings,
@@ -727,9 +729,12 @@ def _clause_categories(clause: str) -> list[tuple[str, set[str]]]:
     return out
 
 
-def missing_category_warnings(query: str, strategies: Sequence[Strategy]) -> list[str]:
-    """修改句里有删除/调整动词、但所给策略中都没有该类别的条件 → “当前策略中没有××条件，该部分未生效。”"""
-    present = {c.metric for st in strategies for c in st.conditions}
+def missing_category_warnings(query: str, present_metrics: Iterable[str]) -> list[str]:
+    """修改句里有删除/调整动词、但提到的类别在 present_metrics 中没有任何条件 → “当前策略中没有××条件，该部分未生效。”
+
+    present_metrics 应为修改前与修改后策略的指标并集：修改时新增了该类条件、或该类条件本来存在（已被删除/调整），都不提示。
+    """
+    present = set(present_metrics)
     out: list[str] = []
     for clause in _CLAUSE_SPLIT.split(query or ""):
         if not clause.strip() or not _MOD_VERB.search(clause):
@@ -812,23 +817,36 @@ class _Modifier:
         text = self._risk(clause)
         if not _meaningful(text) or _GENERIC_BODY.match(text):
             return
+        fm = FORECAST_METRIC.search(text)
+        if fm is not None:
+            # “放宽预测市盈率”：策略里不可能有预测类条件，也不能拿市盈率TTM代替 → 整个分句只记 unsupported
+            if all(u.phrase != fm.group(0) for u in self.unsupported):
+                self.unsupported.append(Unsupported(phrase=fm.group(0), reason=FORECAST_REASON, alternative=FORECAST_ALTERNATIVE))
+            return
+        before = {c.metric for c in self.conds}
+        miss: Unsupported | None = None  # “没有找到要修改的条件”：若是因为该类条件本就不存在，改为 warning
         if _LOOSEN.search(text):
-            self._adjust(text, clause, "loosen")
+            miss = self._adjust(text, clause, "loosen")
         elif _TIGHTEN.search(text):
-            self._adjust(text, clause, "tighten")
+            miss = self._adjust(text, clause, "tighten")
         elif _REMOVE.search(text):
-            self._remove(text, clause)
+            miss = self._remove(text, clause)
         elif _TARGET_VALUE.search(text) and self._targets(text):
-            self._adjust(text, clause, "set")
+            miss = self._adjust(text, clause, "set")
         else:
             mask = _Mask(text)
             switched = await self._switch_universe(text, mask)
             added = self._add(mask)
             if not switched and not added:
-                self.unsupported.append(Unsupported(
+                miss = Unsupported(
                     phrase=clause, reason="没有识别出要做的修改",
                     alternative="可以说“放宽/收紧 + 指标”“去掉 + 指标或原短语”“只看 + 股票池”，或直接描述要新增的条件",
-                ))
+                )
+        # 要删除/调整的类别在当前策略中不存在（修改前后都没有）→ 明确提示该部分未生效，不静默忽略
+        absent = missing_category_warnings(text, before | {c.metric for c in self.conds})
+        self.warnings += [m for m in absent if m not in self.warnings]
+        if miss is not None and not absent:
+            self.unsupported.append(miss)
 
     def _risk(self, clause: str) -> str:
         """处理“剔除/保留 ST、次新”；返回去掉这些片段后的分句。"""
@@ -876,30 +894,22 @@ class _Modifier:
         metrics = _metrics_in(body)
         return [i for i, c in enumerate(self.conds) if c.metric in metrics]
 
-    def _absent(self, clause: str) -> bool:
-        """要删除/调整的类别在当前策略中不存在 → 写 warning（该部分未生效），返回 True。"""
-        current = self.base.model_copy(update={"conditions": self.conds})
-        msgs = missing_category_warnings(clause, [current])
-        self.warnings += [m for m in msgs if m not in self.warnings]
-        return bool(msgs)
-
     def _generic(self, text: str) -> bool:
         body = _TARGET_VALUE.sub(" ", _ACTION_WORDS.sub(" ", text))
         return bool(_GENERIC_BODY.match(body))
 
     # ── 动作 ──
 
-    def _adjust(self, text: str, clause: str, mode: Mode) -> None:
+    def _adjust(self, text: str, clause: str, mode: Mode) -> Unsupported | None:
+        """放宽/收紧/改为某值；找不到目标条件时返回待定的 unsupported（由 _clause 决定是否改为 warning）。"""
         verb = _MODE_VERB[mode]
         targets = self._targets(text)
         if not targets and mode != "set" and self._generic(text):
             targets = [i for i, c in enumerate(self.conds) if c.enabled and c.origin != "system" and op_family(c.op) != "bool"]
         if not targets:
-            if not self._absent(clause):
-                self.unsupported.append(Unsupported(
-                    phrase=clause, reason=f"没有找到要{verb}的条件", alternative=f"请写明指标或原短语，例如“{verb}估值”“{verb}波动率”",
-                ))
-            return
+            return Unsupported(
+                phrase=clause, reason=f"没有找到要{verb}的条件", alternative=f"请写明指标或原短语，例如“{verb}估值”“{verb}波动率”",
+            )
         explicit = _TARGET_VALUE.search(text)
         applied = False
         zero: list[Condition] = []
@@ -921,7 +931,7 @@ class _Modifier:
             self.changes += condition_changes(old, new, verb=direction_verb(old, new))
             applied = True
         if applied:
-            return
+            return None
         if explicit is not None:
             self.unsupported.append(Unsupported(
                 phrase=clause, reason="相关条件的口径或方向与给定数值不匹配，未能修改",
@@ -929,6 +939,7 @@ class _Modifier:
             ))
         for c in zero:
             self.warnings.append(f"「{describe(c)}」阈值为 0，按比例{verb}不改变阈值，可在条件编辑器中直接修改。")
+        return None
 
     def _explicit(self, c: Condition, m: re.Match[str], mode: Mode) -> Condition | None:
         """“放宽到行业70%分位”“收紧到30倍”“改成20%”：按给定数值修改。
@@ -974,18 +985,18 @@ class _Modifier:
             return None
         return n
 
-    def _remove(self, text: str, clause: str) -> None:
+    def _remove(self, text: str, clause: str) -> Unsupported | None:
+        """删除目标条件；找不到时返回待定的 unsupported（由 _clause 决定是否改为 warning）。"""
         targets = self._targets(text)
         if not targets:
-            if not self._absent(clause):
-                self.unsupported.append(Unsupported(
-                    phrase=clause, reason="没有找到要删除的条件", alternative="请写明指标或原短语，例如“去掉回撤条件”“删除估值合理”",
-                ))
-            return
+            return Unsupported(
+                phrase=clause, reason="没有找到要删除的条件", alternative="请写明指标或原短语，例如“去掉回撤条件”“删除估值合理”",
+            )
         drop = set(targets)
         for i in sorted(drop):
             self.changes.append(f"删除条件：{describe(self.conds[i])}")
         self.conds = [c for i, c in enumerate(self.conds) if i not in drop]
+        return None
 
     async def _switch_universe(self, text: str, mask: _Mask) -> bool:
         hits = _scan_universe_lexicon(mask)
@@ -1043,3 +1054,35 @@ def _metrics_in(body: str) -> set[str]:
         if re.search(pat, body, re.IGNORECASE):
             out.update(mids)
     return out
+
+
+def guard_negative_caps(strategy: Strategy, clarifications: list[Clarification]) -> list[str]:
+    """AI/规则生成的“PE < X”类条件：估值倍数为负（亏损等）也会满足上限，自动改为“介于 0 ~ X”并说明。"""
+    from ..engine.conditions import describe as _describe
+
+    names: list[str] = []
+
+    def lower_ok(c: Condition) -> bool:
+        if c.op in ("gt", "gte") and c.value is not None:
+            return c.value >= 0
+        return c.op == "between" and c.value is not None and c.value2 is not None and min(c.value, c.value2) >= 0
+
+    def fix(conds: list[Condition]) -> None:
+        for c in conds:
+            md = catalog.METRICS.get(c.metric)
+            if md is None or not md.positive_only_for_rank or c.op not in ("lt", "lte") or c.value is None or c.value <= 0:
+                continue
+            if c.origin not in ("ai", "rule") or any(lower_ok(o) for o in conds if o is not c and o.metric == c.metric):
+                continue
+            c.op, c.value2, c.value = "between", float(c.value), 0.0
+            c.rationale = ((c.rationale + "；") if c.rationale else "") + "自动补充下限 0：排除亏损（负值）"
+            c.label = _describe(c)
+            names.append(md.name)
+
+    fix(strategy.conditions)
+    for cl in clarifications:
+        for o in cl.options:
+            fix(o.conditions)
+    if not names:
+        return []
+    return [f"“{'、'.join(dict.fromkeys(names))}”的上限条件已自动改为“介于 0 ~ 上限”，以排除亏损或负值公司；如需包含负值，可在条件表中改回“小于”。"]

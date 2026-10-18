@@ -1,6 +1,10 @@
 """筛选结果解释（DESIGN §6.4）：模板解释（确定性）+ LLM 解释（数字校验 + 合规校验，不通过回退模板）。
 
 句子类型：直接引用字段数值 = fact；基于分位/阈值的定性判断 = inference；缺失/不适用 = uncertain；口径与局限 = caveat。
+
+LLM 解释的确定性后处理：
+- 运行摘要：不把数据集状态交给 LLM，LLM 写到数据集状态的句子直接删除；数据集“部分失败/获取失败”句由模板按运行记录生成后追加；
+- 个股解读：事实句缺报告期/时点时，按 refs 指向的条件证据在句末补“（期间；来源：接口·字段）”。
 """
 
 from __future__ import annotations
@@ -8,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import math
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, get_args
 
 from .. import catalog
@@ -16,6 +20,7 @@ from ..engine.conditions import SCOPE_SHORT, describe, fmt_num, normalize
 from ..schemas import (
     CondEval,
     Condition,
+    Evidence,
     Explanation,
     ExplanationSentence,
     ScreenResult,
@@ -44,6 +49,16 @@ _STOCK_CAVEAT = "以上判定只基于所列数据条件与对应报告期/时�
 _SUMMARY_CAVEAT = "以上统计只描述本次条件在当前数据上的筛选结果，不预测股价表现，不构成投资建议。"
 _FAIL_PREFIX = "AI 文本未通过数字校验，已改用模板："
 _CALL_FAIL_PREFIX = "AI 文本生成失败，已改用模板："
+# 校验范围：只核对数字是否出现在证据中，不核对每句定性表述（比较、归因）
+VERIFIED_NOTE = "文中数字均出现在引擎证据中（不代表每句定性表述都经逐条核对）"
+_DATASET_NOTE = "数据集状态句由系统按运行记录生成（非 AI 撰写）"
+# 运行摘要里关于数据集/接口获取状态的说法：LLM 拿不到数据集状态，写出来的都是推断，删除
+_DATASET_CLAIM = re.compile(
+    r"数据集|数据源|(?:获取|取数|调用|部分)失败|已跳过|未请求|(?<![A-Za-z])(?:skipped|partial|failed|succeeded)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+
+PostProcess = Callable[[list[ExplanationSentence]], tuple[list[ExplanationSentence], list[str]]]
 
 # 数字校验：日期整体拆成年/月/日；减号只有在前面不是数字/字母时才算负号（“2026-2”→ 2026 与 2）
 _DATE = re.compile(r"(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})\s*日?")
@@ -104,38 +119,52 @@ def _allowed(x: float, allowed: Iterable[float]) -> bool:
     return False
 
 
-def _verify(raw: Any, facts: Mapping[str, Any], valid_refs: set[str]) -> tuple[list[ExplanationSentence] | None, str]:
-    """校验 LLM 输出：结构、句子类型、数字、禁语。通过返回 (句子, 说明)，否则 (None, 原因)。"""
+def _verify(
+    raw: Any, facts: Mapping[str, Any], valid_refs: set[str], drop: Callable[[str], bool] | None = None,
+) -> tuple[list[ExplanationSentence] | None, list[str]]:
+    """校验 LLM 输出：结构、句子类型、禁语、数字。通过返回 (句子, 说明)，否则 (None, [原因])。
+
+    drop(text) 为真的句子（如运行摘要里关于数据集状态的说法）在禁语检查之后直接删除，不参与数字校验。
+    """
     if not isinstance(raw, Mapping) or not isinstance(raw.get("sentences"), list) or not raw["sentences"]:
-        return None, "输出缺少 sentences 数组"
+        return None, ["输出缺少 sentences 数组"]
     allowed: set[float] = set()
     _collect_numbers(facts, allowed)
     sentences: list[ExplanationSentence] = []
-    checked = 0
+    dropped = 0
     for i, item in enumerate(raw["sentences"], 1):
         if not isinstance(item, Mapping) or not isinstance(item.get("text"), str) or not item["text"].strip():
-            return None, f"第 {i} 句结构不合法"
+            return None, [f"第 {i} 句结构不合法"]
         text = item["text"].strip()
         kind = item.get("kind")
         if kind not in _KINDS:
-            return None, f"第 {i} 句类型「{kind}」不合法"
+            return None, [f"第 {i} 句类型「{kind}」不合法"]
         _, violations = compliance.sanitize_output(text)
         if violations:
-            return None, f"第 {i} 句含不合规表述（{'、'.join(violations)}）"
+            return None, [f"第 {i} 句含不合规表述（{'、'.join(violations)}）"]
+        if drop is not None and drop(text):
+            dropped += 1
+            continue
         for x in extract_numbers(text):
-            checked += 1
             if not _allowed(x, allowed):
-                return None, f"第 {i} 句中的数字 {fmt_num(x)} 在证据中找不到"
+                return None, [f"第 {i} 句中的数字 {fmt_num(x)} 在证据中找不到"]
         refs = item.get("refs") if isinstance(item.get("refs"), list) else []
         sentences.append(_s(text, kind, [str(r) for r in refs if str(r) in valid_refs]))
+    if not any(s.kind != "caveat" for s in sentences):
+        return None, ["AI 文本没有可用的解释内容" + (f"（已删除 {dropped} 句数据集状态描述）" if dropped else "")]
     if sentences[-1].kind != "caveat":
         sentences.append(_s(_STOCK_CAVEAT if "stock" in facts else _SUMMARY_CAVEAT, "caveat"))
-    return sentences, f"AI 文本中的 {checked} 个数字均已与证据核对"
+    notes = [VERIFIED_NOTE]
+    if dropped:
+        notes.append(f"已删除 AI 文本中 {dropped} 句关于数据集状态的描述（AI 未获得数据集状态，以系统生成的数据集说明为准）")
+    return sentences, notes
 
 
 async def _llm_explain(
     llm: Any, system: str, user: str, facts: Mapping[str, Any], valid_refs: set[str], template: Explanation,
+    *, drop: Callable[[str], bool] | None = None, finish: PostProcess | None = None,
 ) -> Explanation:
+    """调用 LLM → 校验（drop 删除指定句子）→ finish 做确定性后处理；任何失败回退模板并在 verification_notes 写明原因。"""
     if llm is None or not getattr(llm, "enabled", True):
         return template.model_copy(update={"verification_notes": [*template.verification_notes, _CALL_FAIL_PREFIX + "未配置大模型"]})
     try:
@@ -146,10 +175,21 @@ async def _llm_explain(
     except Exception as e:  # noqa: BLE001 — 解释失败不影响结果，回退模板
         reason = str(e).strip() or type(e).__name__
         return template.model_copy(update={"verification_notes": [*template.verification_notes, _CALL_FAIL_PREFIX + reason[:120]]})
-    sentences, note = _verify(raw, facts, valid_refs)
+    sentences, notes = _verify(raw, facts, valid_refs, drop)
     if sentences is None:
-        return template.model_copy(update={"verified": True, "verification_notes": [*template.verification_notes, _FAIL_PREFIX + note]})
-    return Explanation(sentences=sentences, generator="llm", verified=True, verification_notes=[note])
+        return template.model_copy(update={"verified": True, "verification_notes": [*template.verification_notes, _FAIL_PREFIX + notes[0]]})
+    if finish is not None:
+        sentences, extra = finish(sentences)
+        notes += extra
+    return Explanation(sentences=sentences, generator="llm", verified=True, verification_notes=notes)
+
+
+def _before_trailing_caveats(sentences: Sequence[ExplanationSentence], extra: Sequence[ExplanationSentence]) -> list[ExplanationSentence]:
+    """把 extra 插在末尾提示句（caveat）之前：正文之后、“不构成投资建议”之前。"""
+    i = len(sentences)
+    while i > 0 and sentences[i - 1].kind == "caveat":
+        i -= 1
+    return [*sentences[:i], *extra, *sentences[i:]]
 
 
 # ───────────────────────────── 个股解释 ─────────────────────────────
@@ -281,11 +321,71 @@ def _stock_facts(stock: StockResult, strategy: Strategy) -> dict[str, Any]:
     }
 
 
+_SENTENCE_END = re.compile(r"[。！？!?；;.]+$")
+
+
+def _source_brief(src: SourceRef) -> str:
+    """“接口·字段”（无接口时用提供方名称）。"""
+    head = src.endpoint or _PROVIDER_LABEL.get(src.provider, src.provider)
+    return f"{head}·{src.field}" if src.field else head
+
+
+_PERIOD_INNER = re.compile(r"（([^（）]+)）")
+
+
+def _mentions_period(text: str, period: str) -> bool:
+    """句子是否已写出该证据的期间：整句期间、括号前的主体（“2026年中报”），或括号内的代码/时点（“2026-2”“截至2026-10-16”）。
+
+    括号内的片段按数字边界匹配，避免“2026-1”误中“2026-10-16”。
+    """
+    core = period.split("（", 1)[0].strip()
+    if period in text or (len(core) >= 2 and core in text):
+        return True
+    m = _PERIOD_INNER.search(period)
+    inner = m.group(1).strip() if m else ""
+    return len(inner) >= 4 and re.search(rf"(?<!\d){re.escape(inner)}(?!\d)", text) is not None
+
+
+def _period_tail(evd: Evidence) -> str:
+    return f"{evd.period}；来源：{_source_brief(evd.sources[0])}" if evd.sources else str(evd.period)
+
+
+def _with_periods(sentences: list[ExplanationSentence], stock: StockResult) -> tuple[list[ExplanationSentence], list[str]]:
+    """kind=fact 且 refs 指向条件的句子若没写期间，句末补“（期间；来源：接口·字段）”（取自该条件的证据）。"""
+    evs = {ev.condition_id: ev for ev in stock.evaluations}
+    out: list[ExplanationSentence] = []
+    patched = 0
+    for s in sentences:
+        tails: list[str] = []
+        if s.kind == "fact":
+            for r in s.refs:
+                ev = evs.get(r)
+                evd = ev.evidence if ev is not None else None
+                if evd is None or not evd.period or _mentions_period(s.text, evd.period):
+                    continue
+                tail = _period_tail(evd)
+                if tail not in tails:
+                    tails.append(tail)
+        if tails:
+            m = _SENTENCE_END.search(s.text)
+            body, end = (s.text[: m.start()], m.group(0)) if m else (s.text, "。")
+            # 概括多个条件的句子只提示去看证据表，避免一句话挂多段括号
+            suffix = f"（{tails[0]}）" if len(tails) == 1 else "（各条件的报告期/时点与来源见下方证据表）"
+            s = s.model_copy(update={"text": body + suffix + end})
+            patched += 1
+        out.append(s)
+    notes = [f"已为 {patched} 句事实句补充报告期/时点与来源（取自对应条件的引擎证据）"] if patched else []
+    return out, notes
+
+
 async def llm_stock_explanation(stock: StockResult, strategy: Strategy, llm: Any) -> Explanation:
     template = template_stock_explanation(stock, strategy)
     facts = _stock_facts(stock, strategy)
     refs = {ev.condition_id for ev in stock.evaluations} | {c.id for c in strategy.conditions if c.id}
-    return await _llm_explain(llm, prompts.STOCK_SYSTEM, prompts.build_stock_user(facts), facts, refs, template)
+    return await _llm_explain(
+        llm, prompts.STOCK_SYSTEM, prompts.build_stock_user(facts), facts, refs, template,
+        finish=lambda sentences: _with_periods(sentences, stock),
+    )
 
 
 # ───────────────────────────── 运行摘要 ─────────────────────────────
@@ -297,6 +397,19 @@ def _pool(result: ScreenResult) -> tuple[str, int]:
         return result.universe.name, result.universe.size or n
     u = result.strategy.universe
     return (u.name or u.query or "未命名股票池"), n
+
+
+def _dataset_sentences(result: ScreenResult) -> list[ExplanationSentence]:
+    """数据集“部分失败/获取失败”的不确定句（确定性模板，状态用中文）；本策略不需要而跳过的数据集不写。"""
+    return [
+        _s(
+            f"数据集「{ds.label}」{_DS_STATUS_LABEL[ds.status]}（成功 {ds.succeeded}/{ds.requested}），"
+            "依赖它的条件可能被判为数据缺失，相关结果需谨慎解读。",
+            "uncertain",
+        )
+        for ds in result.datasets
+        if ds.status in ("partial", "failed")
+    ]
 
 
 def template_run_summary(result: ScreenResult) -> Explanation:
@@ -331,13 +444,7 @@ def template_run_summary(result: ScreenResult) -> Explanation:
         worst = max(miss, key=lambda st: st.missing) if miss else None
         tail = f"；缺失最多的条件是「{worst.label}」（{worst.missing} 只）" if worst else ""
         out.append(_s(f"有 {n_mi} 只股票因关键数据缺失无法判定，未计入入选{tail}。", "uncertain", [worst.condition_id] if worst else []))
-    for ds in result.datasets:
-        if ds.status in ("partial", "failed"):
-            out.append(_s(
-                f"数据集「{ds.label}」{_DS_STATUS_LABEL[ds.status]}（成功 {ds.succeeded}/{ds.requested}），"
-                "依赖它的条件可能被判为数据缺失，相关结果需谨慎解读。",
-                "uncertain",
-            ))
+    out += _dataset_sentences(result)
     for c in result.conflicts:
         if c.kind == "data_coverage":
             out.append(_s(c.message, "uncertain", c.condition_ids))
@@ -356,6 +463,7 @@ def template_run_summary(result: ScreenResult) -> Explanation:
 
 
 def _summary_facts(result: ScreenResult) -> dict[str, Any]:
+    """交给 LLM 的运行事实。不含任何数据集状态：数据集说明由模板按运行记录确定性生成（见 llm_run_summary）。"""
     name, size = _pool(result)
     facts: dict[str, Any] = {
         "universe": {"name": name, "size": size},
@@ -368,11 +476,6 @@ def _summary_facts(result: ScreenResult) -> dict[str, Any]:
             }
             for st in result.condition_stats
         ],
-        "datasets": [
-            {"label": ds.label, "status": _DS_STATUS_LABEL.get(ds.status, ds.status), "requested": ds.requested, "succeeded": ds.succeeded, "failed": ds.failed}
-            for ds in result.datasets
-            if ds.status in ("partial", "failed")  # 未请求（skipped）的数据集与本次条件无关，不交给 LLM，避免误读为异常
-        ],
     }
     if result.report_period is not None:
         facts["report_period"] = {"label": result.report_period.label, "report": result.report_period.report}
@@ -381,8 +484,23 @@ def _summary_facts(result: ScreenResult) -> dict[str, Any]:
     return facts
 
 
+def _dataset_claim(text: str) -> bool:
+    return bool(_DATASET_CLAIM.search(text))
+
+
 async def llm_run_summary(result: ScreenResult, llm: Any) -> Explanation:
+    """LLM 写正文（不涉及数据集状态，写了也删除）；数据集“部分失败/获取失败”句由模板生成，插在末尾提示句之前。"""
     template = template_run_summary(result)
     facts = _summary_facts(result)
     refs = {st.condition_id for st in result.condition_stats}
-    return await _llm_explain(llm, prompts.SUMMARY_SYSTEM, prompts.build_summary_user(facts), facts, refs, template)
+    ds_sentences = _dataset_sentences(result)
+
+    def finish(sentences: list[ExplanationSentence]) -> tuple[list[ExplanationSentence], list[str]]:
+        if not ds_sentences:
+            return sentences, []
+        return _before_trailing_caveats(sentences, ds_sentences), [_DATASET_NOTE]
+
+    return await _llm_explain(
+        llm, prompts.SUMMARY_SYSTEM, prompts.build_summary_user(facts), facts, refs, template,
+        drop=_dataset_claim, finish=finish,
+    )

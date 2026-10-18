@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from app.ai import prompts
 from app.ai.explain import (
+    VERIFIED_NOTE,
+    _summary_facts,
     extract_numbers,
     llm_run_summary,
     llm_stock_explanation,
@@ -35,9 +38,11 @@ class FakeLLM:
 
     def __init__(self, response: Any = None, exc: Exception | None = None) -> None:
         self.response, self.exc, self.calls = response, exc, 0
+        self.users: list[str] = []
 
     async def chat_json(self, system: str, user: str, **kw: Any) -> dict:
         self.calls += 1
+        self.users.append(user)
         if self.exc is not None:
             raise self.exc
         return self.response
@@ -160,3 +165,75 @@ async def test_llm_stock_ok_and_errors() -> None:
     assert e.generator == "template" and any("生成失败" in n for n in e.verification_notes)
     e = await llm_stock_explanation(_stock(), _strategy(), FakeLLM({"sentences": [{"text": "x", "kind": "guess"}]}))
     assert e.generator == "template"
+
+
+async def test_llm_summary_gets_no_dataset_status_and_template_appends_dataset_sentences() -> None:
+    """#2：facts 不含数据集状态；LLM 自己写的数据集说法被删除；模板按运行记录追加 partial/failed 的中文不确定句。"""
+    res = _result()
+    res.datasets.append(DatasetStatus(
+        dataset="dividends", label="分红送转事件", endpoint="/api/a-share/corporate-actions/dividends", status="skipped",
+    ))
+    facts = _summary_facts(res)
+    assert "datasets" not in facts
+    out = {"sentences": [
+        {"text": "股票池沪深300共 300 只，入选 12 只、排除 280 只、数据缺失 8 只。", "kind": "fact", "refs": []},
+        {"text": "其余数据集均为skipped。", "kind": "uncertain", "refs": []},
+        {"text": "利润表数据集状态为partial，部分股票数据获取失败。", "kind": "uncertain", "refs": []},
+        {"text": "结果不构成投资建议。", "kind": "caveat", "refs": []},
+    ]}
+    llm = FakeLLM(out)
+    e = await llm_run_summary(res, llm)
+    assert e.generator == "llm" and e.verified
+    assert "datasets" not in llm.users[0] and "利润表（季报序列）" not in llm.users[0]
+    texts = [s.text for s in e.sentences]
+    joined = "\n".join(texts)
+    assert "其余数据集均为skipped" not in joined and "skipped" not in joined and "partial" not in joined
+    ds = [s for s in e.sentences if "数据集「" in s.text]
+    assert len(ds) == 1 and ds[0].kind == "uncertain"
+    assert ds[0].text.startswith("数据集「利润表（季报序列）」部分失败（成功 280/300）")
+    assert "估值快照" not in joined and "分红送转事件" not in joined  # ok 与本策略不需要（skipped）的数据集都不写
+    assert texts[0].startswith("股票池沪深300") and texts.index(ds[0].text) > 0  # 追加在 LLM 句子之后
+    assert e.sentences[-1].kind == "caveat"
+    assert VERIFIED_NOTE == "文中数字均出现在引擎证据中（不代表每句定性表述都经逐条核对）"
+    assert VERIFIED_NOTE in e.verification_notes
+    assert any("已删除" in n and "2" in n for n in e.verification_notes)
+    assert "不要描述任何数据集" in prompts.SUMMARY_SYSTEM
+
+    # 没有 partial/failed 的数据集：不追加任何数据集句
+    res_ok = _result()
+    res_ok.datasets = [d for d in res_ok.datasets if d.status == "ok"]
+    e = await llm_run_summary(res_ok, FakeLLM(out))
+    assert e.generator == "llm" and not any("数据集" in s.text for s in e.sentences)
+
+    # 只写了数据集状态（删除后没有正文）：回退模板
+    only_ds = {"sentences": [{"text": "其余数据集均为skipped。", "kind": "uncertain", "refs": []},
+                             {"text": "结果不构成投资建议。", "kind": "caveat", "refs": []}]}
+    e = await llm_run_summary(res, FakeLLM(only_ds))
+    assert e.generator == "template" and any("没有可用" in n for n in e.verification_notes)
+
+
+async def test_llm_stock_fact_sentences_get_period_and_source() -> None:
+    """#15：fact 句缺报告期/时点时，句末按 refs 指向的条件证据补“（期间；来源：接口·字段）”。"""
+    out = {"sentences": [
+        {"text": "营业收入同比增长率为12.30%，高于> 0%的门槛，判定通过。", "kind": "fact", "refs": ["c1"]},
+        {"text": "市盈率TTM为 18.50 倍（实时快照），判定通过。", "kind": "fact", "refs": ["c2"]},
+        {"text": "两项条件均判定通过", "kind": "fact", "refs": ["c1", "c2"]},
+        {"text": "市盈率在行业内分位为 23.4%，处于较低水平。", "kind": "inference", "refs": ["c2"]},
+        {"text": "经营现金流数据缺失，无法判定。", "kind": "fact", "refs": ["c3"]},
+        {"text": "报告期 2026-2 的营业收入同比为 12.30%。", "kind": "fact", "refs": ["c1"]},
+    ]}
+    e = await llm_stock_explanation(_stock(), _strategy(), FakeLLM(out))
+    assert e.generator == "llm" and e.verified
+    s = [x.text for x in e.sentences]
+    assert s[0] == (
+        "营业收入同比增长率为12.30%，高于> 0%的门槛，判定通过"
+        "（2026年中报（2026-2）；来源：/api/a-share/financials/indicators·yoy_revenue）。"
+    )
+    assert s[1] == out["sentences"][1]["text"]  # 已写期间：不重复补
+    assert s[2] == "两项条件均判定通过（各条件的报告期/时点与来源见下方证据表）。"  # 多条件概括句不串挂多段括号
+    assert s[3] == out["sentences"][3]["text"]  # 非 fact 句不补
+    assert s[4] == out["sentences"][4]["text"]  # 条件无证据（缺失）不补
+    assert s[5] == out["sentences"][5]["text"]  # 已写报告期代码 2026-2：不补
+    assert e.sentences[-1].kind == "caveat"
+    assert VERIFIED_NOTE in e.verification_notes and any("补充报告期/时点与来源" in n for n in e.verification_notes)
+    assert "period" in prompts.STOCK_SYSTEM and "source" in prompts.STOCK_SYSTEM

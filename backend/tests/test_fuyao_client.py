@@ -16,6 +16,8 @@ from app.data.fuyao import (
     FuyaoClient,
     FuyaoError,
     TokenBucket,
+    fault_error,
+    is_no_dividend_events,
     parse_envelope,
 )
 
@@ -128,6 +130,29 @@ async def test_error_code_mapping_and_retry_counts(code: int, kind: str) -> None
     assert f"code={code}" in e.brief() and f"request_id=rid-{code}" in e.brief()
     assert route.call_count == 1 + RETRY_LIMITS.get(kind, 0)
     assert len(sleeper.delays) == RETRY_LIMITS.get(kind, 0)
+
+
+async def test_no_dividend_events_3002_is_recognized_and_not_retried() -> None:
+    div_path = "/api/a-share/corporate-actions/adjustment-factors"
+    msg = "No adjustment events for thscode=000002.SZ"
+    with respx.mock(assert_all_called=False) as router:
+        route = router.get(BASE_URL + div_path).mock(return_value=err_response(3002, rid="rid-nodiv", message=msg))
+        client, sleeper = make_client()
+        with pytest.raises(FuyaoError) as ei:
+            await client.get(div_path, {"thscode": "000002.SZ", "from": "2025-09-12"}, 86400, "dividends")
+        await client.aclose()
+    e = ei.value
+    assert (e.code, e.kind, e.request_id, e.message) == (3002, "not_ready", "rid-nodiv", msg)
+    assert route.call_count == 1 and sleeper.delays == []
+    assert is_no_dividend_events(e) is True
+    # 只认分红送转数据集上带 "No adjustment events" 的 3002；其他 3002、其他数据集、演示故障注入都不算
+    common = {"kind": "not_ready", "code": 3002, "request_id": "r", "endpoint": div_path}
+    assert is_no_dividend_events(FuyaoError("数据未就绪", dataset="dividends", **common)) is False  # type: ignore[arg-type]
+    assert is_no_dividend_events(FuyaoError(msg, dataset="indicators", **common)) is False  # type: ignore[arg-type]
+    assert is_no_dividend_events(FuyaoError(msg, dataset="dividends", simulated=True, **common)) is False  # type: ignore[arg-type]
+    assert is_no_dividend_events(FuyaoError(msg, kind="upstream_unavailable", code=5003, dataset="dividends")) is False
+    assert is_no_dividend_events(fault_error("dividends", div_path, kind="not_ready")) is False
+    assert is_no_dividend_events(None) is False
 
 
 async def test_http_429_then_success_with_backoff() -> None:

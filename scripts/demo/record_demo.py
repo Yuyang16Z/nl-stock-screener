@@ -1,9 +1,9 @@
-"""自动录制演示视频：Playwright 驱动真实页面，逐步叠加字幕、高亮当前区域，并记录每步时间点用于对齐旁白。
+"""自动录制演示视频：Playwright 驱动真实页面，逐步叠加两行字幕（区域名称 + 功能说明）并高亮当前区域。
 
 依赖（不进项目依赖）：pip install playwright imageio-ffmpeg && python -m playwright install chromium
-旁白：narration.json（say 字段）→ 用 macOS `say` 合成 audio/<id>.aiff，durations.json 记录时长。
-用法：python record_demo.py <BASE_URL> <AUDIO_DIR> <OUT_DIR>
-输出：<OUT_DIR>/raw.webm（无声录屏）与 <OUT_DIR>/timeline.json（每步开始时间，秒）。
+字幕：subtitles.json（cap=标题，sub=说明）；每步停留时间按阅读速度（约 6 字/秒）计算。
+用法：python record_demo.py <BASE_URL> <OUT_DIR>
+输出：<OUT_DIR>/*.webm（录屏）与 <OUT_DIR>/timeline.json（每步开始时间，秒）。
 """
 
 from __future__ import annotations
@@ -16,9 +16,12 @@ from pathlib import Path
 
 from playwright.sync_api import Locator, Page, sync_playwright
 
-BASE, AUDIO, OUT = sys.argv[1].rstrip("/"), Path(sys.argv[2]), Path(sys.argv[3])
-STEPS = {s["id"]: s for s in json.load(open(AUDIO / "durations.json", encoding="utf-8"))}
-ORDER = [s["id"] for s in json.load(open(AUDIO / "durations.json", encoding="utf-8"))]
+BASE, OUT = sys.argv[1].rstrip("/"), Path(sys.argv[2])
+_SUBS = json.load(open(Path(__file__).resolve().parent / "subtitles.json", encoding="utf-8"))
+for _s in _SUBS:  # 阅读时长：说明约 7.5 字/秒 + 标题扫读，另留 0.8 秒
+    _s["dur"] = round(max(3.5, (len(_s["cap"]) * 0.4 + len(_s["sub"])) / 7.5 + 0.8), 2)
+STEPS = {s["id"]: s for s in _SUBS}
+ORDER = [s["id"] for s in _SUBS]
 W, H = 1440, 900
 
 OVERLAY = """
@@ -27,8 +30,8 @@ OVERLAY = """
     if (document.getElementById('__cap')) return;
     const css = (el, s) => Object.assign(el.style, s);
     const cap = document.createElement('div'); cap.id = '__cap';
-    css(cap, {position:'fixed', left:'50%', bottom:'26px', transform:'translateX(-50%)', maxWidth:'1180px', padding:'12px 24px',
-      background:'rgba(15,23,42,.9)', color:'#fff', font:'600 23px/1.45 "PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif',
+    css(cap, {position:'fixed', left:'50%', bottom:'22px', transform:'translateX(-50%)', width:'1180px', padding:'12px 26px 14px',
+      background:'rgba(15,23,42,.92)', color:'#fff', font:'400 20px/1.55 "PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif',
       borderRadius:'12px', zIndex:2147483647, boxShadow:'0 8px 28px rgba(0,0,0,.28)', textAlign:'center', pointerEvents:'none'});
     const hl = document.createElement('div'); hl.id = '__hl';
     css(hl, {position:'fixed', border:'3px solid #f59e0b', borderRadius:'10px', boxShadow:'0 0 0 9999px rgba(15,23,42,.16)',
@@ -61,8 +64,11 @@ T0 = 0.0
 
 def cap(page: Page, sid: str) -> None:
     i = ORDER.index(sid) + 1
-    page.evaluate("([t, s]) => { const c = document.getElementById('__cap'); if (c) c.textContent = t;"
-                  " const e = document.getElementById('__step'); if (e) e.textContent = s; }", [STEPS[sid]["cap"], f"{i}/{len(ORDER)}"])
+    page.evaluate("([t, b, s]) => { const c = document.getElementById('__cap'); if (c) { c.innerHTML = '';"
+                  " const h = document.createElement('div'); h.textContent = t; Object.assign(h.style, {font: '700 23px/1.4 inherit', color: '#fbbf24', marginBottom: '4px'});"
+                  " const d = document.createElement('div'); d.textContent = b; c.append(h, d); }"
+                  " const e = document.getElementById('__step'); if (e) e.textContent = s; }",
+                  [STEPS[sid]["cap"], STEPS[sid]["sub"], f"{i}/{len(ORDER)}"])
 
 
 def hl(page: Page, loc: Locator, pad: int = 6) -> None:

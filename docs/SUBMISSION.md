@@ -3,7 +3,7 @@
 | 交付物 | 位置 |
 |---|---|
 | 可操作的 Web 产品 | https://screenlens-fkko.onrender.com （Render 免费实例，北京时间 9:00–23:00 保活；其余时段首次打开需约 1 分钟唤醒） |
-| 演示视频（可选项） | 压缩包根目录 `ScreenLens_demo.mp4`（2 分 32 秒，中文字幕 + 旁白，逐块讲解每个区域的功能） |
+| 演示视频（可选项） | 压缩包根目录 `ScreenLens_demo.mp4`（2 分 50 秒，中文字幕逐块讲解每个区域的功能） |
 | 源代码仓库与 README | https://github.com/Yuyang16Z/nl-stock-screener （本压缩包 `ScreenLens/` 目录为同一份代码） |
 | AI 使用与验证记录 | `ScreenLens/docs/AI_USAGE.md` |
 | 测试说明 | `ScreenLens/docs/TESTING.md` |

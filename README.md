@@ -4,6 +4,7 @@
 
 - **在线体验**：https://screenlens-fkko.onrender.com （Render 免费实例；北京时间 9:00–23:00 保活，其余时段首次打开需约 1 分钟唤醒）
 - **源代码**：https://github.com/Yuyang16Z/nl-stock-screener
+- **演示视频**（2 分 32 秒，中文字幕 + 旁白，逐块讲解功能）：提交压缩包内 `ScreenLens_demo.mp4`；由 `scripts/demo/make_video.py` 自动生成（Playwright 驱动真实页面录屏、macOS 语音合成旁白、ffmpeg 混音）
 - **设计规格**：[docs/DESIGN.md](docs/DESIGN.md) · **数据口径与实测核验**：[docs/DATA_SOURCES.md](docs/DATA_SOURCES.md) · **AI 使用与验证记录**：[docs/AI_USAGE.md](docs/AI_USAGE.md) · **测试说明**：[docs/TESTING.md](docs/TESTING.md)
 
 ## 1. 用户怎么用

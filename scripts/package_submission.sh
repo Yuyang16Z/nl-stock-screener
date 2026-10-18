@@ -7,6 +7,7 @@ TMP="$(mktemp -d)"
 mkdir -p "$TMP/ScreenLens"
 git -C "$ROOT" archive --format=tar HEAD | tar -x -C "$TMP/ScreenLens"
 cp "$ROOT/docs/SUBMISSION.md" "$TMP/SUBMISSION.md"
+[ -f "$ROOT/../ScreenLens_demo.mp4" ] && cp "$ROOT/../ScreenLens_demo.mp4" "$TMP/ScreenLens_demo.mp4"
 rm -f "$OUT"
 (cd "$TMP" && zip -qr "$OUT" .)
 rm -rf "$TMP"

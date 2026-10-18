@@ -1,0 +1,82 @@
+{
+ "steps": [
+  {
+   "id": "title",
+   "t": 1.608
+  },
+  {
+   "id": "header",
+   "t": 13.991
+  },
+  {
+   "id": "input",
+   "t": 18.813
+  },
+  {
+   "id": "understand",
+   "t": 25.084
+  },
+  {
+   "id": "clarify",
+   "t": 30.814
+  },
+  {
+   "id": "conditions",
+   "t": 38.877
+  },
+  {
+   "id": "run",
+   "t": 47.511
+  },
+  {
+   "id": "overview",
+   "t": 54.029
+  },
+  {
+   "id": "summary",
+   "t": 63.452
+  },
+  {
+   "id": "table",
+   "t": 68.927
+  },
+  {
+   "id": "drawer",
+   "t": 72.699
+  },
+  {
+   "id": "impact",
+   "t": 82.958
+  },
+  {
+   "id": "whatif",
+   "t": 90.683
+  },
+  {
+   "id": "provenance",
+   "t": 97.174
+  },
+  {
+   "id": "backtest",
+   "t": 103.325
+  },
+  {
+   "id": "fault",
+   "t": 119.625
+  },
+  {
+   "id": "compliance",
+   "t": 131.96
+  },
+  {
+   "id": "library",
+   "t": 136.856
+  },
+  {
+   "id": "end",
+   "t": 143.023
+  }
+ ],
+ "total": 151.66,
+ "video": "/private/tmp/claude-501/-Users-andy-Desktop----AI-Agent---------/37102fa8-fe2b-48d9-abdd-04463070fa4d/scratchpad/video/out/page@45db7460d2b7419b82f575b0f2f43936.webm"
+}

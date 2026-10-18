@@ -422,3 +422,28 @@ def test_parse_envelope_edge_cases() -> None:
     with pytest.raises(FuyaoError) as ei:
         parse_envelope(200, b'{"code":5999,"message":"m","request_id":"r9","data":null}', **common)
     assert ei.value.kind == "internal" and ei.value.request_id == "r9"
+
+
+async def test_identical_inflight_requests_are_coalesced() -> None:
+    """启动预热与用户运行同时请求同一数据时只发一次请求。"""
+    import asyncio as _asyncio
+
+    import httpx as _httpx
+
+    from app.data.cache import ApiCache
+    from app.data.fuyao import FuyaoClient
+    from app.config import Settings
+
+    calls = {"n": 0}
+
+    async def handler(request: _httpx.Request) -> _httpx.Response:
+        calls["n"] += 1
+        await _asyncio.sleep(0.05)
+        return _httpx.Response(200, json={"code": 0, "message": "ok", "request_id": "r1", "data": {"timestamp": 1, "item": []}})
+
+    settings = Settings(fuyao_api_key="k", fuyao_rps=1000.0)
+    client = FuyaoClient(settings, ApiCache(":memory:"), transport=_httpx.MockTransport(handler), backoff_base_s=0)
+    rs = await _asyncio.gather(*(client.get("/api/x", {"a": 1}, 60, "snapshot") for _ in range(5)))
+    await client.aclose()
+    assert calls["n"] == 1 and all(r.request_id == "r1" for r in rs)
+    assert client.stats["coalesced"] == 4

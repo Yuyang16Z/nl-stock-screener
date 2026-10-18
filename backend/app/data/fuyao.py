@@ -427,7 +427,9 @@ class FuyaoClient:
         self._sem = asyncio.Semaphore(max(1, int(settings.fuyao_max_concurrency)))
         self._bucket = TokenBucket(settings.fuyao_rps)
         self._http: httpx.AsyncClient | None = None
-        self.stats: dict[str, int] = {"requests": 0, "cache_hits": 0, "retries": 0, "errors": 0, "faults": 0}
+        self.stats: dict[str, int] = {"requests": 0, "cache_hits": 0, "retries": 0, "errors": 0, "faults": 0, "coalesced": 0}
+        # 同一请求（路径+参数）正在进行时，后来者等待同一结果，避免启动预热与用户运行重复取数
+        self._inflight: dict[str, asyncio.Future[FuyaoResponse]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -489,6 +491,23 @@ class FuyaoClient:
                     dataset=dataset,
                 )
 
+        pending = self._inflight.get(key)
+        if pending is not None:
+            self.stats["coalesced"] += 1
+            shared = await asyncio.shield(pending)
+            return shared.model_copy(update={"dataset": dataset})
+        task = asyncio.ensure_future(self._fetch(path, clean, dataset, key, use_cache, ttl_s))
+        self._inflight[key] = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if self._inflight.get(key) is task:
+                self._inflight.pop(key, None)
+
+    async def _fetch(
+        self, path: str, clean: dict[str, Any], dataset: str, key: str, use_cache: bool, ttl_s: int
+    ) -> FuyaoResponse:
+        """真正发请求（含重试与写缓存）；由 get() 负责同请求合并。"""
         attempt = 0
         while True:
             try:
